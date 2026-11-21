@@ -251,6 +251,8 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
     let mut opp_s = [0u32; 3];
     let mut opp_h = [0u32; 3];
     let mut lz = [0u32; 2];
+    let mut olz = [0u32; 2];
+    let mut rear_tot = [0.0f64; 2];
     let t_start = Instant::now();
     for k in 0..runs {
         let seed = seed0 + k;
@@ -267,6 +269,7 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
                     "aggro" => Kind::Aggro,
                     "squad" | "duel" => Kind::Squad,
                     "squad2" => Kind::Squad2,
+                    "squad3" => Kind::Squad3,
                     "duelg" => Kind::Aggro,
                     "dummy" => Kind::Dummy,
                     "hard" => if i % 2 == 0 { Kind::Aggro } else { Kind::Rusher },
@@ -306,6 +309,8 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
                     acc_s[b] += m.shots[b];
                     acc_h[b] += m.hits[b];
                 }
+                rear_tot[0] += m.dmg_rear;
+                rear_tot[1] += m.dmg_mech;
                 lz[0] += m.laser_shots;
                 lz[1] += m.laser_hits;
                 for (j, e) in f.mechs.iter().enumerate() {
@@ -314,6 +319,8 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
                             opp_s[b] += e.shots[b];
                             opp_h[b] += e.hits[b];
                         }
+                        olz[0] += e.laser_shots;
+                        olz[1] += e.laser_hits;
                     }
                 }
                 line += &format!(
@@ -339,6 +346,12 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
         println!("{line}");
     }
     println!("SEEN fraction {:.3}", seen_total / alive_total.max(1e-9));
+    println!("REAR_RAW {:.0} {:.0}", rear_tot[0], rear_tot[1]);
+    println!(
+        "ACC_RAW {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        acc_s[0], acc_h[0], acc_s[1], acc_h[1], acc_s[2], acc_h[2], lz[0], lz[1],
+        opp_s[0], opp_h[0], opp_s[1], opp_h[1], opp_s[2], opp_h[2], olz[0], olz[1]
+    );
     let pct = |h: u32, s: u32| if s == 0 { 0.0 } else { 100.0 * h as f64 / s as f64 };
     println!(
         "ACCURACY ours gun <60 {:.0}% ({}) <120 {:.0}% ({}) >=120 {:.0}% ({}) laser {:.0}% ({}) | opponents gun <60 {:.0}% <120 {:.0}% >=120 {:.0}%",

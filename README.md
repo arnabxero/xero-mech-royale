@@ -48,11 +48,17 @@ fallback when `hello.map.dir` is missing):
   buildings. Hold spots prefer a wall at our back. The torso then sweeps only the open sector, so
   the rear (hits there do x1.5) faces the wall. The bot moves silently (< 5 m/s) near enemies.
 - **Engagement policy** (`Tune`, all parameters overridable with `XERO_TUNE=key=val,...`):
-  - **Solo duel**: when at most one enemy is around, fight it head-on. With HP above 70% the bot
-    attacks a lone visible enemy first.
-  - With several threats, use **cover**: break line of sight from far attackers and stay hidden
-    8 s after the last hit (regen starts after 5 s), then re-choose the hold spot.
-  - Fight anything within 55 m. Hunt weak enemies. Retreat to cover below 45% HP.
+  - Fight anything within 55 m, fight back against attackers within 90 m while healthy, and hunt
+    weak enemies.
+  - Against a far attacker, use **cover**: break line of sight, stay hidden 8 s after the last hit
+    (regen starts after 5 s), then re-choose the hold spot.
+  - Retreat to cover below 45% HP.
+  - Optional (off by default): **solo duel** (fight a lone attacker head-on), proactive
+    engagement of a lone enemy, and NPC drone farming/fight-back.
+- **Aiming**: lead for the gun (intercept solve), and aim at the first body point with a clear
+  line. The torso follows the gun lead while the laser charges, then hands off to the laser aim
+  near full charge and releases only when on target. A held charge is never wasted, and the gun
+  doesn't fire at strafing targets beyond 140 m.
 - **Peek-fighting against lasers**: hide while an enemy laser is `charging` (or held) and aimed at
   us, step out during its cooldown, and pre-charge our own laser behind cover.
 - **Blind return fire**: laser beams reveal the shooter's muzzle, and damage events give a bearing.

@@ -74,6 +74,13 @@ pub struct Tune {
     /// v5 aiming: LOS-aware aim point, laser/gun aim hand-off, no wasted laser releases,
     /// no long-range gun spam at strafing targets
     pub aim_v2: bool,
+    /// reload the gun while the target is out of line of sight and the magazine is half empty
+    pub tac_reload: bool,
+    /// open fire on any enemy closer than this even when not fighting it (0 = only when engaged)
+    pub shoot_close: f64,
+    /// after breaking LOS, stay in cover until this HP fraction (0 = off), up to 30 s,
+    /// unless an enemy comes within 45 m
+    pub cover_heal_hp: f64,
     /// sidestep incoming bullets and mortar impacts
     pub dodge: bool,
 }
@@ -103,6 +110,9 @@ impl Default for Tune {
             npc_fight: false,
             aim_noise: 0.0,
             aim_v2: true,
+            tac_reload: false,
+            shoot_close: 50.0,
+            cover_heal_hp: 0.0,
             dodge: true,
         }
     }
@@ -153,6 +163,9 @@ impl Tune {
                 "npc_fight" => self.npc_fight = v != 0.0,
                 "aim_noise" => self.aim_noise = v,
                 "aim_v2" => self.aim_v2 = v != 0.0,
+                "tac_reload" => self.tac_reload = v != 0.0,
+                "shoot_close" => self.shoot_close = v,
+                "cover_heal_hp" => self.cover_heal_hp = v,
                 "dodge" => self.dodge = v != 0.0,
                 _ => eprintln!("unknown tune key {k}"),
             }
@@ -715,6 +728,16 @@ impl Bot {
                     self.cover_until = o.t + self.tune.cover_hold_s;
                 }
             } else if o.t < self.cover_until && self.tune.cover_from_far {
+                mode = Mode::Cover;
+                cover_from = self.cover_threats.clone();
+            } else if self.tune.cover_heal_hp > 0.0
+                && self.cover_spot.is_some()
+                && hp_frac < self.tune.cover_heal_hp
+                && o.t - self.cover_until < 30.0
+                && !urgent
+                && enemies.iter().all(|e| d2(e.pos, pos) > 45.0)
+            {
+                // keep healing behind cover (regen needs 5 s without damage dealt or taken)
                 mode = Mode::Cover;
                 cover_from = self.cover_threats.clone();
             }
@@ -1839,7 +1862,12 @@ impl Bot {
                 los = los || has_los(muzzle, [tg.pos[0], tg.pos[1], tg.pos[2] + 7.5]);
             }
             let center = center;
-            let shoot_ok = mode == Mode::Fight || mode == Mode::Retreat || mode == Mode::Cover || (o.t - tg.hurt_us_t < 4.0) || d < 50.0 || self.tune.aggressive;
+            let shoot_ok = mode == Mode::Fight
+                || mode == Mode::Retreat
+                || mode == Mode::Cover
+                || (o.t - tg.hurt_us_t < 4.0)
+                || d < self.tune.shoot_close
+                || self.tune.aggressive;
             if shoot_ok {
                 engaged = true;
                 // choose weapon per slot
@@ -1938,6 +1966,13 @@ impl Bot {
                 }
                 if let Some(a) = desired {
                     aim = a;
+                }
+                if self.tune.tac_reload && !los {
+                    for wo in me.weapons.iter().flatten() {
+                        if wo.kind == "gun" && wo.reload.unwrap_or(0.0) <= 0.0 && wo.ammo.unwrap_or(12.0) <= wo.stat("mag", 12.0) * 0.5 {
+                            act.reload = true;
+                        }
+                    }
                 }
             }
         }

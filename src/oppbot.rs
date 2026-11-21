@@ -71,6 +71,8 @@ pub struct Tune {
     pub npc_farm_until: f64,
     /// simulator only: aiming error (radians, persistent for 0.5 s) to model weaker opponents
     pub aim_noise: f64,
+    /// simulator only: do not lead moving targets (aim at their current position)
+    pub no_lead: bool,
     /// sidestep incoming bullets and mortar impacts
     pub dodge: bool,
 }
@@ -98,6 +100,7 @@ impl Default for Tune {
             solo_first_hp: 0.7,
             npc_farm_until: 300.0,
             aim_noise: 0.0,
+            no_lead: false,
             dodge: true,
         }
     }
@@ -1847,7 +1850,8 @@ impl Bot {
                         "gun" => {
                             let speed = wo.stat("speed", 252.0);
                             let range = wo.stat("range", 230.0);
-                            let a = lead_aim(muzzle, center, tg.vel, speed);
+                            let lv = if self.tune.no_lead { [0.0, 0.0, 0.0] } else { tg.vel };
+                            let a = lead_aim(muzzle, center, lv, speed);
                             if desired.is_none() && !laser_phase {
                                 desired = Some(a);
                             }

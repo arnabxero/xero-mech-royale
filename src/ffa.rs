@@ -16,6 +16,8 @@ pub enum Kind {
     Aggro,
     Squad,
     Squad2,
+    /// practice model 3: squad bots fight each other like FFA bots; hunters focus only on us
+    Squad3,
     Example,
     Rusher,
     Camper,
@@ -75,6 +77,9 @@ pub struct SimMech {
     pub hits: [u32; 3],
     pub laser_shots: u32,
     pub laser_hits: u32,
+    /// damage taken from behind (x1.5 already applied) and in total, from mechs
+    pub dmg_rear: f64,
+    pub dmg_mech: f64,
     /// seconds during which at least one living enemy could see this mech
     pub seen_s: f64,
     /// seconds alive
@@ -222,6 +227,25 @@ impl<'a> Ffa<'a> {
                     b.tune = crate::oppbot::Tune::aggressive();
                     Some(b)
                 }
+                Kind::Squad3 => {
+                    let mut b = OppBot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
+                    // SQUAD_FIGHT=<m>: non-hunters only start fights within <m> (and fight back);
+                    // unset: fully aggressive FFA among themselves
+                    match std::env::var("SQUAD_FIGHT").ok().and_then(|v| v.parse::<f64>().ok()) {
+                        Some(r) => {
+                            b.tune.fight_close = r;
+                            b.tune.fight_back_range = 230.0;
+                            b.tune.cover_from_far = false;
+                            b.tune.retreat_hp = 0.0;
+                            b.tune.hunt_weak_range = r;
+                        }
+                        None => b.tune = crate::oppbot::Tune::aggressive(),
+                    }
+                    b.tune.dodge = false;
+                    b.tune.solo_duel = false;
+                    b.tune.npc_farm_until = 0.0;
+                    Some(b)
+                }
                 Kind::Squad2 => {
                     let mut b = OppBot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
                     // non-hunters ignore us unless we shoot them (SQUAD_PASSIVE=0 makes them engage within 45 m)
@@ -272,7 +296,7 @@ impl<'a> Ffa<'a> {
                     Some(SimWeapon::gun()),
                     if *k == Kind::Squad {
                         Some(SimWeapon::of("laser"))
-                    } else if *k == Kind::Squad2 {
+                    } else if *k == Kind::Squad2 || *k == Kind::Squad3 {
                         None // assigned with skill below
                     } else if *k == Kind::Ours {
                         std::env::var("SIM_OURS_WEAPON").ok().map(|w| SimWeapon::of(&w))
@@ -301,6 +325,8 @@ impl<'a> Ffa<'a> {
                 hits: [0; 3],
                 laser_shots: 0,
                 laser_hits: 0,
+                dmg_rear: 0.0,
+                dmg_mech: 0.0,
                 seen_s: 0.0,
                 alive_s: 0.0,
                 modes: HashMap::new(),
@@ -343,7 +369,7 @@ impl<'a> Ffa<'a> {
         let laser_from: usize = std::env::var("SQUAD_LASER_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
         let mut grade = 0usize;
         for m in f.mechs.iter_mut() {
-            if m.kind == Kind::Squad2 {
+            if m.kind == Kind::Squad2 || m.kind == Kind::Squad3 {
                 if let Some(b) = m.opp.as_mut() {
                     b.tune.aim_noise = base_noise * (1.0 - grade as f64 / 16.0);
                 }
@@ -352,6 +378,13 @@ impl<'a> Ffa<'a> {
                 }
                 f.skill.push((m.id, grade));
                 grade += 1;
+            }
+        }
+        if std::env::var("SQUAD_NOLEAD").is_ok() {
+            for m in f.mechs.iter_mut() {
+                if let Some(b) = m.opp.as_mut() {
+                    b.tune.no_lead = true;
+                }
             }
         }
         f.add_hunter();
@@ -402,7 +435,9 @@ impl<'a> Ffa<'a> {
             self.hunters.push(j);
             if let Some(b) = self.mechs[j].opp.as_mut() {
                 let noise = b.tune.aim_noise;
+                let nl = b.tune.no_lead;
                 b.tune = crate::oppbot::Tune::aggressive();
+                b.tune.no_lead = nl;
                 b.tune.hunt = true;
                 b.tune.dodge = false;
                 b.tune.solo_duel = false;
@@ -467,7 +502,11 @@ impl<'a> Ffa<'a> {
             if squad_i && matches!(self.mechs[j].kind, Kind::Squad | Kind::Squad2) {
                 continue; // teammates
             }
-            let hunting = squad_i && (self.hunters.contains(&i) || t >= self.all_hunt_t);
+            let s3_hunter = self.mechs[i].kind == Kind::Squad3 && (self.hunters.contains(&i) || t >= self.all_hunt_t);
+            if s3_hunter && self.mechs[j].kind != Kind::Ours {
+                continue; // hunters only care about us
+            }
+            let hunting = (squad_i || s3_hunter) && (self.hunters.contains(&i) || t >= self.all_hunt_t);
             if self.can_see(i, j) || (hunting && self.mechs[j].kind == Kind::Ours) {
                 self.mechs[i].seen.insert(j, t);
             }
@@ -686,6 +725,10 @@ impl<'a> Ffa<'a> {
         let t = self.t;
         {
             let m = &mut self.mechs[target];
+            m.dmg_mech += amt;
+            if rear {
+                m.dmg_rear += amt;
+            }
             m.hp -= amt;
             m.last_combat_t = t;
             m.dmg_taken += amt;
@@ -706,7 +749,7 @@ impl<'a> Ffa<'a> {
             a.events.push(Event { kind: "hit".into(), target: Some(target as f64), amount: Some(amt), weapon: Some(weapon.into()), ..Default::default() });
         }
         if self.mechs[target].hp <= 0.0 {
-            if self.mechs[by].kind == Kind::Ours && matches!(self.mechs[target].kind, Kind::Squad | Kind::Squad2) {
+            if self.mechs[by].kind == Kind::Ours && matches!(self.mechs[target].kind, Kind::Squad | Kind::Squad2 | Kind::Squad3) {
                 self.add_hunter();
             }
             self.mechs[target].killer = Some(by);
@@ -802,11 +845,13 @@ impl<'a> Ffa<'a> {
         let n = self.mechs.len();
         if self.t >= self.all_hunt_t && self.tick % 20 == 0 {
             for j in 0..n {
-                if self.mechs[j].kind == Kind::Squad || self.mechs[j].kind == Kind::Squad2 {
+                if matches!(self.mechs[j].kind, Kind::Squad | Kind::Squad2 | Kind::Squad3) {
                     if let Some(b) = self.mechs[j].opp.as_mut() {
                         if !b.tune.hunt {
                             let noise = b.tune.aim_noise;
+                            let nl = b.tune.no_lead;
                             b.tune = crate::oppbot::Tune::aggressive();
+                            b.tune.no_lead = nl;
                             b.tune.hunt = true;
                             b.tune.dodge = false;
                             b.tune.solo_duel = false;
