@@ -1,6 +1,6 @@
 # STATUS: xero-mech (Mech Royale)
 
-_Last updated: Fri 2026-11-20 late (v5.1)_
+_Last updated: Fri 2026-11-20 late (v5.2)_
 
 ## Versions
 | Version | Commit | Practice (48 vs house squad) | Notes |
@@ -29,7 +29,22 @@ _Last updated: Fri 2026-11-20 late (v5.1)_
 | v5-duel | 2ff5d30 | 3.52 | v5 + solo duel |
 | v5-strafe | eb68039 | 3.06 | v5 + faster strafe reversals |
 | v5.0.1 | 50ea7de | (same behaviour as v5) | optional knobs: tac_reload, cover_heal_hp, shoot_close |
-| v5.1 | see `git log` (the "v5.1:" commit) | pending | **v5 + trigger timing fix** (fire when the cooldown ends inside the decision window) |
+| v5.1 | 127088b | pending | v5 + trigger timing fix (fire when the cooldown ends inside the decision window) |
+| v5.1-slowstrafe | f32184d | pending | v5.1 + strafe_min=2,strafe_max=4 |
+| v5.2 | see `git log` (the "v5.2:" commit) | pending | **v5.1 + latency-compensated gun lead** |
+
+## Changes in v5.2 (vs v5.1)
+- **Latency-compensated gun lead.** Shots leave 1-2 ticks (0.05-0.1 s) after the observed state.
+  The gun intercept is now solved from the target's position advanced by 0.05 s and from our own
+  muzzle advanced by our velocity. The laser release aim also accounts for our motion.
+  (`gun_lat=0.05`, `self_comp=1`.)
+- Sim (vs v5.1): 1v1 vs gun hunter 56.1% -> 58.0% wins, squad3 7.27 -> 7.40.
+- Tuning checked and left unchanged:
+  - Gun tolerance: 2 m is near the optimum. 1.2 m costs 16 points of duel win rate; 3 m is equal.
+  - Laser tolerance 1.0-2.4 m: equal.
+  - Firing at moving targets beyond 140 m: neutral to slightly positive (kept at 140 for now).
+- Conformance (server, sandboxed docker, 1 pinned core): PASS 300/300, answer ms p50 0.4 / p90 0.7
+  / p99 14.9 / max 15.1.
 
 ## Changes in v5.1 (vs v5)
 - **Trigger timing fix (execution bug).** We used to pull the trigger only when a weapon's cooldown

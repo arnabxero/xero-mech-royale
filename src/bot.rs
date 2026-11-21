@@ -81,6 +81,20 @@ pub struct Tune {
     /// hold the trigger when a weapon's cooldown ends within this decision's window (the server
     /// fires as soon as it ends); without it a 0.24 s gun only fires every ~0.3 s
     pub fire_early: bool,
+    /// gun fire tolerance: aim error allowed, as meters at the target plus radians
+    pub gun_tol_m: f64,
+    pub gun_tol_rad: f64,
+    /// laser release tolerance in meters at the target
+    pub laser_tol_m: f64,
+    /// extra lead time for the gun: shots leave 1-2 ticks after the observed state
+    pub gun_lat: f64,
+    /// hold gun fire at moving targets beyond this distance (m)
+    pub gun_far: f64,
+    /// preferred fighting distance with a gun only / with a laser
+    pub pref_gun: f64,
+    pub pref_laser: f64,
+    /// also account for our own motion during that latency (muzzle moves)
+    pub self_comp: bool,
     /// after breaking LOS, stay in cover until this HP fraction (0 = off), up to 30 s,
     /// unless an enemy comes within 45 m
     pub cover_heal_hp: f64,
@@ -116,6 +130,14 @@ impl Default for Tune {
             tac_reload: false,
             shoot_close: 50.0,
             fire_early: true,
+            gun_tol_m: 2.0,
+            gun_tol_rad: 0.01,
+            laser_tol_m: 1.6,
+            gun_lat: 0.05,
+            gun_far: 140.0,
+            pref_gun: 60.0,
+            pref_laser: 90.0,
+            self_comp: true,
             cover_heal_hp: 0.0,
             dodge: true,
         }
@@ -170,6 +192,14 @@ impl Tune {
                 "tac_reload" => self.tac_reload = v != 0.0,
                 "shoot_close" => self.shoot_close = v,
                 "fire_early" => self.fire_early = v != 0.0,
+                "gun_tol_m" => self.gun_tol_m = v,
+                "gun_tol_rad" => self.gun_tol_rad = v,
+                "laser_tol_m" => self.laser_tol_m = v,
+                "gun_lat" => self.gun_lat = v,
+                "gun_far" => self.gun_far = v,
+                "pref_gun" => self.pref_gun = v,
+                "pref_laser" => self.pref_laser = v,
+                "self_comp" => self.self_comp = v != 0.0,
                 "cover_heal_hp" => self.cover_heal_hp = v,
                 "dodge" => self.dodge = v != 0.0,
                 _ => eprintln!("unknown tune key {k}"),
@@ -1069,11 +1099,11 @@ impl Bot {
         if has("lightning") {
             30.0
         } else if has("laser") {
-            90.0
+            self.tune.pref_laser
         } else if has("mortar") {
             80.0
         } else {
-            60.0
+            self.tune.pref_gun
         }
     }
 
@@ -1896,14 +1926,21 @@ impl Bot {
                         "gun" => {
                             let speed = wo.stat("speed", 252.0);
                             let range = wo.stat("range", 230.0);
-                            let a = lead_aim(muzzle, center, tg.vel, speed);
+                            let lat = self.tune.gun_lat;
+                            let c_lat = [center[0] + tg.vel[0] * lat, center[1] + tg.vel[1] * lat, center[2]];
+                            let m_lat = if self.tune.self_comp {
+                                [muzzle[0] + me.vel[0] * lat, muzzle[1] + me.vel[1] * lat, muzzle[2]]
+                            } else {
+                                muzzle
+                            };
+                            let a = lead_aim(m_lat, c_lat, tg.vel, speed);
                             if desired.is_none() && !laser_phase {
                                 desired = Some(a);
                             }
                             let err = ang_err(me.aim, a);
-                            let tol = (2.0f64 / d.max(1.0)).atan() + 0.01;
+                            let tol = (self.tune.gun_tol_m / d.max(1.0)).atan() + self.tune.gun_tol_rad;
                             // beyond ~140 m a strafing target is almost never hit (sim: ~10%)
-                            let worth = !self.tune.aim_v2 || d < 140.0 || tspeed < 4.0 || tg.ghost;
+                            let worth = !self.tune.aim_v2 || d < self.tune.gun_far || tspeed < 4.0 || tg.ghost;
                             if los && worth && d < range * 0.98 && err < tol && wo.cooldown <= cd_win && wo.ammo.unwrap_or(1.0) > 0.0 {
                                 fire[si] = true;
                             }
@@ -1931,13 +1968,14 @@ impl Bot {
                             // hitscan: aim where the target will be when the release takes effect (~0.075 s)
                             let lt = 0.075;
                             let pc = [center[0] + tg.vel[0] * lt, center[1] + tg.vel[1] * lt, center[2]];
-                            let a2 = [(pc[1] - muzzle[1]).atan2(pc[0] - muzzle[0]), (pc[2] - muzzle[2]).atan2(d2(pc, muzzle).max(0.1))];
+                            let mz = if self.tune.self_comp { [muzzle[0] + me.vel[0] * lt, muzzle[1] + me.vel[1] * lt, muzzle[2]] } else { muzzle };
+                            let a2 = [(pc[1] - mz[1]).atan2(pc[0] - mz[0]), (pc[2] - mz[2]).atan2(d2(pc, mz).max(0.1))];
                             let _ = a;
                             if laser_phase || !has_gun || desired.is_none() || (!self.tune.aim_v2 && d > 50.0) {
                                 desired = Some(a2);
                             }
                             let err = ang_err(me.aim, a2);
-                            let tol = if self.tune.aim_v2 { (1.6f64 / d.max(1.0)).atan() + 0.002 } else { (2.0f64 / d.max(1.0)).atan() + 0.008 };
+                            let tol = if self.tune.aim_v2 { (self.tune.laser_tol_m / d.max(1.0)).atan() + 0.002 } else { (2.0f64 / d.max(1.0)).atan() + 0.008 };
                             if d < range * 0.97 {
                                 if charge <= 0.0 {
                                     // start charging only if cooled down and roughly aimed

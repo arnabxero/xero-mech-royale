@@ -1,0 +1,1 @@
+/w/repo/target-docker11/release/xero-mech: /w/repo/src/bot.rs /w/repo/src/default_config.json /w/repo/src/ffa.rs /w/repo/src/lib.rs /w/repo/src/main.rs /w/repo/src/nav.rs /w/repo/src/oppbot.rs /w/repo/src/proto.rs /w/repo/src/sim.rs /w/repo/src/world.rs
