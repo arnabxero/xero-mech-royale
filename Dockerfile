@@ -12,4 +12,6 @@ WORKDIR /bot
 COPY --from=build /src/target/release/xero-mech /bot/xero-mech
 # fallback copy of the map (the match mounts the same files at /arena)
 COPY arena /bot/arena
+# variant v551-noprovoke (behaviour switches only; same binary as the base)
+ENV XERO_TUNE=fight_close=0,shoot_close=0
 ENTRYPOINT ["/bot/xero-mech"]
