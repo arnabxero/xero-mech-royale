@@ -12,4 +12,6 @@ WORKDIR /bot
 COPY --from=build /src/target/release/xero-mech /bot/xero-mech
 # fallback copy of the map (the match mounts the same files at /arena)
 COPY arena /bot/arena
+# variant v56-upg-sustain (behaviour switches only; same binary as the base)
+ENV XERO_TUNE=upg_mode=1
 ENTRYPOINT ["/bot/xero-mech"]
