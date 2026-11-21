@@ -12,4 +12,6 @@ WORKDIR /bot
 COPY --from=build /src/target/release/xero-mech /bot/xero-mech
 # fallback copy of the map (the match mounts the same files at /arena)
 COPY arena /bot/arena
+# variant: duel a lone attacker head-on (practice A/B)
+ENV XERO_TUNE=solo_duel=1
 ENTRYPOINT ["/bot/xero-mech"]
