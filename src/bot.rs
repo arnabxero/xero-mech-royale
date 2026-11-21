@@ -101,6 +101,16 @@ pub struct Tune {
     pub avoid_sounds: bool,
     /// how long (s) an enemy sighting keeps penalising hold spots near it
     pub avoid_mem: f64,
+    /// repulsion strength while avoiding, and hold-spot penalty weight near known enemies
+    pub avoid_w: f64,
+    pub avoid_pen: f64,
+    /// move silently (< 5 m/s, no footsteps) while avoiding instead of at walking speed
+    pub avoid_silent: bool,
+    /// when the match looks like a free-for-all (mechs dying that we did not kill), switch on
+    /// avoidance with this radius (0 = never). In practice the house squad never kills itself.
+    pub ffa_avoid_r: f64,
+    /// deaths not caused by us that mark the match as a free-for-all
+    pub ffa_deaths: f64,
     /// retreat threshold (HP fraction) while 2+ distinct attackers hit us within 6 s (0 = off)
     pub gang_retreat_hp: f64,
     /// cube pickup search radius (m)
@@ -153,12 +163,17 @@ impl Default for Tune {
             gun_tol_rad: 0.01,
             laser_tol_m: 1.6,
             gun_lat: 0.05,
-            gun_far: 140.0,
+            gun_far: 240.0,
             slew_credit: 0.0,
-            avoid_r: 200.0,
+            avoid_r: 0.0,
             roof_hold: false,
-            avoid_sounds: true,
+            avoid_sounds: false,
             avoid_mem: 20.0,
+            avoid_w: 1.5,
+            avoid_pen: 25.0,
+            avoid_silent: false,
+            ffa_avoid_r: 200.0,
+            ffa_deaths: 2.0,
             gang_retreat_hp: 0.0,
             cube_radius: 60.0,
             kill_loot: 0.0,
@@ -232,6 +247,11 @@ impl Tune {
                 "roof_hold" => self.roof_hold = v != 0.0,
                 "avoid_sounds" => self.avoid_sounds = v != 0.0,
                 "avoid_mem" => self.avoid_mem = v,
+                "avoid_w" => self.avoid_w = v,
+                "avoid_pen" => self.avoid_pen = v,
+                "avoid_silent" => self.avoid_silent = v != 0.0,
+                "ffa_avoid_r" => self.ffa_avoid_r = v,
+                "ffa_deaths" => self.ffa_deaths = v,
                 "gang_retreat_hp" => self.gang_retreat_hp = v,
                 "kill_loot" => self.kill_loot = v,
                 "loot_radius_full" => self.loot_radius_full = v,
@@ -346,6 +366,8 @@ pub struct Bot {
     pub peeking: bool,
     /// (position, time) of mechs we killed: their cubes and weapons drop there
     kill_spots: Vec<([f64; 3], f64)>,
+    our_kills: u32,
+    pub ffa_detected: bool,
     cover_until: f64,
     cover_spot: Option<(f64, f64)>,
     cover_threats: Vec<[f64; 3]>,
@@ -408,6 +430,8 @@ impl Bot {
             peek: None,
             peeking: false,
             kill_spots: Vec::new(),
+            our_kills: 0,
+            ffa_detected: false,
             cover_until: -1.0,
             cover_spot: None,
             cover_threats: Vec::new(),
@@ -518,6 +542,7 @@ impl Bot {
                     self.last_dealt_t = t;
                 }
                 "kill" => {
+                    self.our_kills += 1;
                     if let Some(tid) = ev.target {
                         if let Some(tr) = self.tracks.get(&(tid as i64)) {
                             self.kill_spots.push((tr.pos, t));
@@ -662,6 +687,18 @@ impl Bot {
         self.stats_n += 1;
         self.deadline = deadline;
         self.update_memory(o);
+        if !self.ffa_detected && self.tune.ffa_avoid_r > 0.0 && o.alive > 0.0 {
+            let total = self.cfg.f("match", "mechs", 16.0);
+            let others_dead = (total - o.alive) - self.our_kills as f64;
+            if others_dead >= self.tune.ffa_deaths {
+                self.ffa_detected = true;
+                if self.tune.avoid_r < self.tune.ffa_avoid_r {
+                    self.tune.avoid_r = self.tune.ffa_avoid_r;
+                    self.tune.avoid_sounds = true;
+                }
+                eprintln!("[xero] t={:.1} free-for-all detected ({} deaths not ours): avoidance on", o.t, others_dead);
+            }
+        }
         if !self.ff_ready {
             // get the first field as early as possible
             self.nav_update(o, deadline);
@@ -1075,11 +1112,12 @@ impl Bot {
                     let along = goal[0] * away[0] + goal[1] * away[1];
                     let g = if along < 0.0 { [goal[0] - along * away[0], goal[1] - along * away[1]] } else { goal };
                     let w = n.min(1.5);
-                    let dir = [g[0] + away[0] * w * 1.5, g[1] + away[1] * w * 1.5];
+                    let aw = self.tune.avoid_w;
+                    let dir = [g[0] + away[0] * w * aw, g[1] + away[1] * w * aw];
                     // stay inside the zone
                     if self.point_safe(o, pos[0] + dir[0] * 12.0, pos[1] + dir[1] * 12.0, 6.0, 4.0) {
                         mv = self.walkable_dir(pos, dir);
-                        speed = speed.max(0.42);
+                        speed = if self.tune.avoid_silent { 0.4 } else { speed.max(0.42) };
                         if mode == Mode::Hold {
                             self.hold_spot = None; // re-pick a spot away from them
                         }
@@ -1839,7 +1877,7 @@ impl Bot {
                         }
                         let de = ((e.pos[0] - x as f64).powi(2) + (e.pos[1] - y as f64).powi(2)).sqrt();
                         if de < self.tune.avoid_r * 1.3 {
-                            enemy_pen += 25.0 * (self.tune.avoid_r * 1.3 - de) / (self.tune.avoid_r * 1.3);
+                            enemy_pen += self.tune.avoid_pen * (self.tune.avoid_r * 1.3 - de) / (self.tune.avoid_r * 1.3);
                         }
                     }
                 }

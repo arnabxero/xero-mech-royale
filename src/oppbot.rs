@@ -73,6 +73,8 @@ pub struct Tune {
     pub aim_noise: f64,
     /// simulator only: do not lead moving targets (aim at their current position)
     pub no_lead: bool,
+    /// simulator only: never open fire unless engaged (no shooting at anything within 50 m)
+    pub passive: bool,
     /// sidestep incoming bullets and mortar impacts
     pub dodge: bool,
 }
@@ -101,6 +103,7 @@ impl Default for Tune {
             npc_farm_until: 300.0,
             aim_noise: 0.0,
             no_lead: false,
+            passive: false,
             dodge: true,
         }
     }
@@ -1838,7 +1841,7 @@ impl Bot {
                 }
             }
             let center = center;
-            let shoot_ok = mode == Mode::Fight || mode == Mode::Retreat || mode == Mode::Cover || (o.t - tg.hurt_us_t < 4.0) || d < 50.0 || self.tune.aggressive;
+            let shoot_ok = mode == Mode::Fight || mode == Mode::Retreat || mode == Mode::Cover || (o.t - tg.hurt_us_t < 4.0) || (d < 50.0 && !self.tune.passive) || self.tune.aggressive;
             if shoot_ok {
                 engaged = true;
                 // choose weapon per slot

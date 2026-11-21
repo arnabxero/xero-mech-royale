@@ -18,6 +18,8 @@ pub enum Kind {
     Squad2,
     /// practice model 3: squad bots fight each other like FFA bots; hunters focus only on us
     Squad3,
+    /// practice model 4: squad2 with fully passive non-hunters (they only shoot back)
+    Squad4,
     Example,
     Rusher,
     Camper,
@@ -249,8 +251,9 @@ impl<'a> Ffa<'a> {
                     b.tune.npc_farm_until = 0.0;
                     Some(b)
                 }
-                Kind::Squad2 => {
+                Kind::Squad2 | Kind::Squad4 => {
                     let mut b = OppBot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
+                    b.tune.passive = *k == Kind::Squad4;
                     // non-hunters ignore us unless we shoot them (SQUAD_PASSIVE=0 makes them engage within 45 m)
                     b.tune.fight_close = if std::env::var("SQUAD_PASSIVE").map(|v| v == "0").unwrap_or(false) { 45.0 } else { 0.0 };
                     b.tune.fight_back_range = 230.0;
@@ -299,7 +302,7 @@ impl<'a> Ffa<'a> {
                     Some(SimWeapon::gun()),
                     if *k == Kind::Squad {
                         Some(SimWeapon::of("laser"))
-                    } else if *k == Kind::Squad2 || *k == Kind::Squad3 {
+                    } else if *k == Kind::Squad2 || *k == Kind::Squad3 || *k == Kind::Squad4 {
                         None // assigned with skill below
                     } else if *k == Kind::Ours {
                         std::env::var("SIM_OURS_WEAPON").ok().map(|w| SimWeapon::of(&w))
@@ -374,7 +377,7 @@ impl<'a> Ffa<'a> {
         let laser_from: usize = std::env::var("SQUAD_LASER_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
         let mut grade = 0usize;
         for m in f.mechs.iter_mut() {
-            if m.kind == Kind::Squad2 || m.kind == Kind::Squad3 {
+            if m.kind == Kind::Squad2 || m.kind == Kind::Squad3 || m.kind == Kind::Squad4 {
                 if let Some(b) = m.opp.as_mut() {
                     b.tune.aim_noise = base_noise * (1.0 - grade as f64 / 16.0);
                 }
@@ -510,8 +513,8 @@ impl<'a> Ffa<'a> {
             if j == i || !self.mechs[j].alive {
                 continue;
             }
-            let squad_i = matches!(self.mechs[i].kind, Kind::Squad | Kind::Squad2);
-            if squad_i && matches!(self.mechs[j].kind, Kind::Squad | Kind::Squad2) {
+            let squad_i = matches!(self.mechs[i].kind, Kind::Squad | Kind::Squad2 | Kind::Squad4);
+            if squad_i && matches!(self.mechs[j].kind, Kind::Squad | Kind::Squad2 | Kind::Squad4) {
                 continue; // teammates
             }
             let s3_hunter = self.mechs[i].kind == Kind::Squad3 && (self.hunters.contains(&i) || t >= self.all_hunt_t);
@@ -726,7 +729,7 @@ impl<'a> Ffa<'a> {
         if !self.mechs[target].alive {
             return;
         }
-        if matches!(self.mechs[target].kind, Kind::Squad | Kind::Squad2) && matches!(self.mechs[by].kind, Kind::Squad | Kind::Squad2) {
+        if matches!(self.mechs[target].kind, Kind::Squad | Kind::Squad2 | Kind::Squad4) && matches!(self.mechs[by].kind, Kind::Squad | Kind::Squad2 | Kind::Squad4) {
             return;
         }
         let amount = amount * (1.0 + 0.04 * self.mechs[by].cubes.min(10.0));
@@ -765,7 +768,7 @@ impl<'a> Ffa<'a> {
             a.events.push(Event { kind: "hit".into(), target: Some(target as f64), amount: Some(amt), weapon: Some(weapon.into()), ..Default::default() });
         }
         if self.mechs[target].hp <= 0.0 {
-            if self.mechs[by].kind == Kind::Ours && matches!(self.mechs[target].kind, Kind::Squad | Kind::Squad2 | Kind::Squad3) {
+            if self.mechs[by].kind == Kind::Ours && matches!(self.mechs[target].kind, Kind::Squad | Kind::Squad2 | Kind::Squad3 | Kind::Squad4) {
                 self.add_hunter();
             }
             self.mechs[target].killer = Some(by);
@@ -882,7 +885,7 @@ impl<'a> Ffa<'a> {
         let n = self.mechs.len();
         if self.t >= self.all_hunt_t && self.tick % 20 == 0 {
             for j in 0..n {
-                if matches!(self.mechs[j].kind, Kind::Squad | Kind::Squad2 | Kind::Squad3) {
+                if matches!(self.mechs[j].kind, Kind::Squad | Kind::Squad2 | Kind::Squad3 | Kind::Squad4) {
                     if let Some(b) = self.mechs[j].opp.as_mut() {
                         if !b.tune.hunt {
                             let noise = b.tune.aim_noise;
