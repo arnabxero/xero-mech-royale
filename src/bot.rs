@@ -97,6 +97,10 @@ pub struct Tune {
     pub avoid_r: f64,
     /// also consider roof spots (reached by jet climbs) as hold spots
     pub roof_hold: bool,
+    /// avoidance also steers away from enemies located by sound (steps, gunfire)
+    pub avoid_sounds: bool,
+    /// retreat threshold (HP fraction) while 2+ distinct attackers hit us within 6 s (0 = off)
+    pub gang_retreat_hp: f64,
     /// cube pickup search radius (m)
     pub cube_radius: f64,
     /// after our own kill, collect drops within 20 m of the death spot up to this far away (0 = off)
@@ -151,6 +155,8 @@ impl Default for Tune {
             slew_credit: 0.0,
             avoid_r: 0.0,
             roof_hold: false,
+            avoid_sounds: false,
+            gang_retreat_hp: 0.0,
             cube_radius: 60.0,
             kill_loot: 0.0,
             loot_radius_full: 70.0,
@@ -221,6 +227,8 @@ impl Tune {
                 "slew_credit" => self.slew_credit = v,
                 "avoid_r" => self.avoid_r = v,
                 "roof_hold" => self.roof_hold = v != 0.0,
+                "avoid_sounds" => self.avoid_sounds = v != 0.0,
+                "gang_retreat_hp" => self.gang_retreat_hp = v,
                 "kill_loot" => self.kill_loot = v,
                 "loot_radius_full" => self.loot_radius_full = v,
                 "pref_laser" => self.pref_laser = v,
@@ -755,7 +763,11 @@ impl Bot {
                 tn.retreat_hp = tn.retreat_hp.min(0.25);
                 tn.hunt_weak_range = tn.hunt_weak_range.max(230.0);
             }
-            let healthy = hp_frac > tn.retreat_hp;
+            let mut attackers6: Vec<i64> = self.dmg_log.iter().filter(|d| o.t - d.0 < 6.0).filter_map(|d| d.2).filter(|b| *b < 100).collect();
+            attackers6.sort();
+            attackers6.dedup();
+            let ganged = self.tune.gang_retreat_hp > 0.0 && attackers6.len() >= 2;
+            let healthy = hp_frac > if ganged { tn.retreat_hp.max(self.tune.gang_retreat_hp) } else { tn.retreat_hp };
             let tn = &tn;
             let our_laser = me.weapons.iter().flatten().any(|w| w.kind == "laser");
             if npc_fight
@@ -1025,6 +1037,26 @@ impl Bot {
                     let k = (r - d) / r;
                     rep[0] += (pos[0] - e.pos[0]) / d * k;
                     rep[1] += (pos[1] - e.pos[1]) / d * k;
+                    close = true;
+                }
+            }
+            if self.tune.avoid_sounds {
+                for snd in self.sounds.iter() {
+                    if o.t - snd.0 > 3.0 {
+                        continue;
+                    }
+                    let dist = match (snd.3.as_str(), snd.2.as_str()) {
+                        ("step", _) | ("boost", _) => 30.0,
+                        ("gun", "near") | ("laser", "near") | ("laser_charge", "near") | ("lightning", _) => 40.0,
+                        ("gun", "mid") | ("laser", "mid") | ("laser_charge", "mid") => 100.0,
+                        _ => continue,
+                    };
+                    if dist >= r {
+                        continue;
+                    }
+                    let k = (r - dist) / r * 0.7;
+                    rep[0] -= snd.1.cos() * k;
+                    rep[1] -= snd.1.sin() * k;
                     close = true;
                 }
             }
