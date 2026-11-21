@@ -74,7 +74,16 @@ pub struct World {
     pub trees: Vec<Tree>,
     pub p: Params,
     pub slope_tan: f32,
+    /// tree spatial grid (cells of TREE_CELL m): CSR of tree indices whose crown overlaps the cell
+    pub tg_nx: usize,
+    pub tg_ny: usize,
+    pub tg_start: Vec<u32>,
+    pub tg: Vec<u32>,
+    /// canopy: foliage length (m) along a sight line beyond which it is blocked
+    pub canopy_block_len: f32,
 }
+
+pub const TREE_CELL: f32 = 16.0;
 
 fn num(v: &Value) -> f32 {
     v.as_f64().unwrap_or(0.0) as f32
@@ -213,6 +222,16 @@ impl World {
             trees,
             p,
             slope_tan: (p.max_slope_deg.to_radians()).tan(),
+            tg_nx: 0,
+            tg_ny: 0,
+            tg_start: Vec::new(),
+            tg: Vec::new(),
+            canopy_block_len: {
+                let r = &w["rules"];
+                let dens = r["canopyDensity"].as_f64().unwrap_or(0.35).max(1e-3);
+                let bt = r["canopyBlockT"].as_f64().unwrap_or(0.25).clamp(1e-3, 0.999);
+                ((1.0 / bt).ln() / dens) as f32
+            },
         };
         wd.rasterize();
         wd.compute_floor();
@@ -220,6 +239,7 @@ impl World {
         wd.compute_wdist();
         wd.compute_jumps();
         wd.compute_cover();
+        wd.build_tree_grid();
         Ok(wd)
     }
 
@@ -630,6 +650,128 @@ impl World {
         for c in 0..acc.len() {
             self.cover[c] = (acc[c] * 40.0).min(255.0) as u8;
         }
+    }
+
+    fn build_tree_grid(&mut self) {
+        let gx = ((self.nx as f32) / TREE_CELL).ceil() as usize + 1;
+        let gy = ((self.ny as f32) / TREE_CELL).ceil() as usize + 1;
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        for (k, t) in self.trees.iter().enumerate() {
+            if t.height <= t.crown_base {
+                continue;
+            }
+            let r = t.crown_r.max(0.5);
+            let i0 = (((t.cx - r - self.min_x) / TREE_CELL).floor().max(0.0)) as usize;
+            let i1 = (((t.cx + r - self.min_x) / TREE_CELL).floor().max(0.0) as usize).min(gx - 1);
+            let j0 = (((t.cy - r - self.min_y) / TREE_CELL).floor().max(0.0)) as usize;
+            let j1 = (((t.cy + r - self.min_y) / TREE_CELL).floor().max(0.0) as usize).min(gy - 1);
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    pairs.push(((j * gx + i) as u32, k as u32));
+                }
+            }
+        }
+        pairs.sort();
+        let mut start = vec![0u32; gx * gy + 1];
+        for p in &pairs {
+            start[p.0 as usize + 1] += 1;
+        }
+        for c in 0..gx * gy {
+            start[c + 1] += start[c];
+        }
+        self.tg_nx = gx;
+        self.tg_ny = gy;
+        self.tg_start = start;
+        self.tg = pairs.iter().map(|p| p.1).collect();
+    }
+
+    /// Length (m) of the segment a-b inside tree crowns (ellipsoids from crownBase to height).
+    pub fn canopy_len(&self, a: [f32; 3], b: [f32; 3]) -> f32 {
+        if self.tg_nx == 0 {
+            return 0.0;
+        }
+        let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if len < 1e-3 {
+            return 0.0;
+        }
+        let n = ((len / 4.0).ceil() as i32).max(1);
+        let mut cells: [u32; 128] = [u32::MAX; 128];
+        let mut nc = 0usize;
+        for s in 0..=n {
+            let f = s as f32 / n as f32;
+            let x = a[0] + d[0] * f;
+            let y = a[1] + d[1] * f;
+            let i = ((x - self.min_x) / TREE_CELL).floor();
+            let j = ((y - self.min_y) / TREE_CELL).floor();
+            if i < 0.0 || j < 0.0 || i as usize >= self.tg_nx || j as usize >= self.tg_ny {
+                continue;
+            }
+            let c = (j as usize * self.tg_nx + i as usize) as u32;
+            if nc == 0 || cells[nc - 1] != c {
+                if !cells[..nc].contains(&c) && nc < 128 {
+                    cells[nc] = c;
+                    nc += 1;
+                }
+            }
+        }
+        let mut seen: Vec<u32> = Vec::new();
+        let mut total = 0.0f32;
+        for &c in &cells[..nc] {
+            let c = c as usize;
+            for &k in &self.tg[self.tg_start[c] as usize..self.tg_start[c + 1] as usize] {
+                if seen.contains(&k) {
+                    continue;
+                }
+                seen.push(k);
+                let t = &self.trees[k as usize];
+                let rz = (t.height - t.crown_base) * 0.5;
+                if rz <= 0.05 {
+                    continue;
+                }
+                let r = t.crown_r.max(0.3);
+                let cz = t.z + t.crown_base + rz;
+                // unit-sphere space
+                let ox = (a[0] - t.cx) / r;
+                let oy = (a[1] - t.cy) / r;
+                let oz = (a[2] - cz) / rz;
+                let dx = d[0] / r;
+                let dy = d[1] / r;
+                let dz = d[2] / rz;
+                let qa = dx * dx + dy * dy + dz * dz;
+                let qb = 2.0 * (ox * dx + oy * dy + oz * dz);
+                let qc = ox * ox + oy * oy + oz * oz - 1.0;
+                let disc = qb * qb - 4.0 * qa * qc;
+                if disc <= 0.0 || qa < 1e-9 {
+                    continue;
+                }
+                let sq = disc.sqrt();
+                let t0 = ((-qb - sq) / (2.0 * qa)).max(0.0);
+                let t1 = ((-qb + sq) / (2.0 * qa)).min(1.0);
+                if t1 > t0 {
+                    total += (t1 - t0) * len;
+                }
+            }
+        }
+        total
+    }
+
+    /// Would a viewer's eye see a mech whose feet are at `feet` (center or top visible, buildings
+    /// and terrain block, dense canopy blocks beyond the near range)?
+    pub fn mech_visible(&self, eye: [f32; 3], feet: [f32; 3], height: f32, near_range: f32) -> bool {
+        let dx = feet[0] - eye[0];
+        let dy = feet[1] - eye[1];
+        let near = dx * dx + dy * dy <= near_range * near_range;
+        for zoff in [height * 0.5, height * 0.98] {
+            let p = [feet[0], feet[1], feet[2] + zoff];
+            if !self.los(eye, p) {
+                continue;
+            }
+            if near || self.canopy_len(eye, p) < self.canopy_block_len {
+                return true;
+            }
+        }
+        false
     }
 
     #[inline]

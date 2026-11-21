@@ -2,3 +2,5 @@
 *.log
 /out/
 /tmp/
+bench_last.txt
+/bench_out/

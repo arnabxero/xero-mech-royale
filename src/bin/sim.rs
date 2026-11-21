@@ -242,6 +242,8 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
     let mut zone_deaths = 0;
     let mut wins = 0;
     let mut place_hist = vec![0u32; 17];
+    let mut seen_total = 0.0;
+    let mut alive_total = 0.0;
     let t_start = Instant::now();
     for k in 0..runs {
         let seed = seed0 + k;
@@ -254,6 +256,8 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
                     "example" => Kind::Example,
                     "rusher" => Kind::Rusher,
                     "camper" => Kind::Camper,
+                    "aggro" => Kind::Aggro,
+                    "hard" => if i % 2 == 0 { Kind::Aggro } else { Kind::Rusher },
                     _ => match i % 3 {
                         0 => Kind::Example,
                         1 => Kind::Rusher,
@@ -280,9 +284,23 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
                 if m.killed_by_zone && m.alive == false && m.death_t < 414.0 {
                     zone_deaths += 1;
                 }
+                let killer = m.killer.map(|k| format!("{:?}#{}", f.mechs[k].kind, k)).unwrap_or_else(|| "-".into());
+                let mut modes: Vec<(String, f64)> = m.modes.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                modes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let ms: Vec<String> = modes.iter().take(4).map(|(k, v)| format!("{k}:{:.0}", v)).collect();
+                seen_total += m.seen_s;
+                alive_total += m.alive_s;
                 line += &format!(
-                    " ours#{i} place {} death {:.0}s{} kills {} dealt {:.0} taken {:.0} zone {:.0} |",
+                    " ours#{i} seen {:.0}/{:.0}s modes {} |",
+                    m.seen_s,
+                    m.alive_s,
+                    ms.join(",")
+                );
+                line += &format!(
+                    " place {} by {} [{}] death {:.0}s{} kills {} dealt {:.0} taken {:.0} zone {:.0} |",
                     places[i],
+                    killer,
+                    m.mode_at_death,
                     if m.alive { f.t } else { m.death_t },
                     if m.killed_by_zone { "(zone)" } else { "" },
                     m.kills,
@@ -294,6 +312,7 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
         }
         println!("{line}");
     }
+    println!("SEEN fraction {:.3}", seen_total / alive_total.max(1e-9));
     println!(
         "FFA SUMMARY runs {runs} ours/match {ours} mix {mix}: mean score {:.2} wins {wins} early-zone-deaths {zone_deaths} places {:?} ({:.1}s)",
         total / n_ours.max(1.0),

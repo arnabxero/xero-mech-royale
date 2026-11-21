@@ -25,8 +25,94 @@ pub struct Track {
     pub is_npc: bool,
 }
 
+/// Behaviour parameters (the survivor defaults are what ships; the simulator also runs an
+/// aggressive variant as a sparring partner).
+#[derive(Clone, Debug)]
+pub struct Tune {
+    pub aggressive: bool,
+    /// always fight enemies closer than this (they see us through proximity sensors anyway)
+    pub fight_close: f64,
+    /// fight back against an attacker within this range when healthy
+    pub fight_back_range: f64,
+    /// hunt weak enemies within this range
+    pub hunt_weak_range: f64,
+    /// retreat to cover below this HP fraction
+    pub retreat_hp: f64,
+    /// break line of sight from attackers farther than fight_back_range
+    pub cover_from_far: bool,
+    /// shoot crates when calm
+    pub crates: bool,
+    /// only retreat when cover is at most this far (m); otherwise keep fighting
+    pub retreat_cover_max: f64,
+    /// strafe direction change interval range (s)
+    pub strafe_min: f64,
+    pub strafe_max: f64,
+    /// zig-zag while retreating/covering
+    pub zigzag: bool,
+}
+
+impl Default for Tune {
+    fn default() -> Self {
+        Tune {
+            aggressive: false,
+            fight_close: 55.0,
+            fight_back_range: 90.0,
+            hunt_weak_range: 160.0,
+            retreat_hp: 0.45,
+            cover_from_far: true,
+            crates: true,
+            retreat_cover_max: 1e9,
+            strafe_min: 0.8,
+            strafe_max: 2.0,
+            zigzag: false,
+        }
+    }
+}
+
+impl Tune {
+    pub fn aggressive() -> Self {
+        Tune {
+            aggressive: true,
+            fight_close: 200.0,
+            fight_back_range: 230.0,
+            hunt_weak_range: 230.0,
+            retreat_hp: 0.0,
+            cover_from_far: false,
+            crates: true,
+            ..Tune::default()
+        }
+    }
+
+    /// Apply overrides like "retreat_hp=0.3,zigzag=1" (used by the simulator for A/B tests).
+    pub fn apply(&mut self, spec: &str) {
+        for kv in spec.split(',') {
+            let mut it = kv.splitn(2, '=');
+            let k = it.next().unwrap_or("").trim();
+            let v: f64 = match it.next().and_then(|v| v.trim().parse().ok()) {
+                Some(v) => v,
+                None => continue,
+            };
+            match k {
+                "fight_close" => self.fight_close = v,
+                "fight_back_range" => self.fight_back_range = v,
+                "hunt_weak_range" => self.hunt_weak_range = v,
+                "retreat_hp" => self.retreat_hp = v,
+                "cover_from_far" => self.cover_from_far = v != 0.0,
+                "crates" => self.crates = v != 0.0,
+                "retreat_cover_max" => self.retreat_cover_max = v,
+                "strafe_min" => self.strafe_min = v,
+                "strafe_max" => self.strafe_max = v,
+                "zigzag" => self.zigzag = v != 0.0,
+                "aggressive" => self.aggressive = v != 0.0,
+                _ => eprintln!("unknown tune key {k}"),
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
+    Cover,
     Rotate,
     Hold,
     Loot,
@@ -97,7 +183,7 @@ pub struct Bot {
     local_goal: Option<(f64, f64)>,
     local_path_t: f64,
     climbing: Option<(usize, f64)>, // (target cell, start t)
-    pos_hist: VecDeque<(f64, [f64; 3], f64)>, // t, pos, commanded speed
+    pos_hist: VecDeque<(f64, [f64; 3], f64, f64)>, // t, pos, commanded speed (0..1), actual horiz speed
     stuck_until: f64,
     stuck_dir: [f64; 2],
     stuck_count: u32,
@@ -116,11 +202,14 @@ pub struct Bot {
     laser_hold: bool,
     pub t: f64,
     blocked_pickups: HashMap<i64, f64>,
+    loot_target: Option<(i64, f64)>,
     crate_target: Option<i64>,
     pub debug: bool,
+    pub tune: Tune,
     pub label: String,
     pub stats_n: u64,
     last_move: [f64; 2],
+    deadline: Instant,
 }
 
 impl Bot {
@@ -165,11 +254,14 @@ impl Bot {
             laser_hold: false,
             t: 0.0,
             blocked_pickups: HashMap::new(),
+            loot_target: None,
             crate_target: None,
             debug: false,
+            tune: Tune::default(),
             label: String::new(),
             stats_n: 0,
             last_move: [0.0, 0.0],
+            deadline: Instant::now(),
         }
     }
 
@@ -318,6 +410,7 @@ impl Bot {
     // ------------------------------------------------------------------ main
     pub fn act(&mut self, o: &Obs, deadline: Instant) -> Action {
         self.stats_n += 1;
+        self.deadline = deadline;
         self.update_memory(o);
         if !self.ff_ready {
             // get the first field as early as possible
@@ -371,14 +464,23 @@ impl Bot {
         let mut goal: Option<(f64, f64)> = None;
         let mut speed: f64 = 1.0;
         let mut want_take: Option<u64> = None;
+        let mut want_drop: Option<u32> = None;
         let mut fight = false;
+        let mut cover_from: Vec<[f64; 3]> = Vec::new();
         if let Some(tg) = &target {
             let d = d2(tg.pos, pos);
             let attacking_us = o.t - tg.hurt_us_t < 4.0;
             let weak = tg.hp < tg.max_hp * 0.35;
-            let healthy = hp_frac > 0.45;
-            if d < 55.0 || (attacking_us && (healthy || d < 90.0)) || (weak && healthy && d < 160.0) {
+            let healthy = hp_frac > self.tune.retreat_hp;
+            let tn = &self.tune;
+            if d < tn.fight_close
+                || (attacking_us && healthy && d < tn.fight_back_range)
+                || (weak && healthy && d < tn.hunt_weak_range)
+                || (tn.aggressive && d < 200.0)
+            {
                 fight = true;
+            } else if attacking_us && tn.cover_from_far {
+                cover_from.push(tg.pos);
             }
             if fight && !healthy && d > 40.0 && !urgent {
                 mode = Mode::Retreat;
@@ -386,8 +488,19 @@ impl Bot {
                 mode = Mode::Fight;
             }
         }
-        if mode == Mode::Rotate && recently_hurt && hp_frac < 0.5 && !urgent {
+        if mode == Mode::Rotate && recently_hurt && hp_frac < 0.5 && !urgent && !self.tune.aggressive {
             mode = Mode::Retreat;
+        }
+        // shot from somewhere we can't (or shouldn't) fight: break line of sight
+        if mode == Mode::Rotate && !urgent && self.tune.cover_from_far {
+            if cover_from.is_empty() && recently_hurt {
+                if let Some(b) = attacker_bearing {
+                    cover_from.push([pos[0] + b.cos() * 120.0, pos[1] + b.sin() * 120.0, pos[2]]);
+                }
+            }
+            if !cover_from.is_empty() {
+                mode = Mode::Cover;
+            }
         }
         if urgent && mode != Mode::Fight {
             mode = Mode::Rotate;
@@ -399,10 +512,11 @@ impl Bot {
         // loot / drops when calm
         let calm = enemies.iter().all(|e| d2(e.pos, pos) > 90.0) && o.t - self.last_hurt_t > 3.0;
         if mode == Mode::Rotate && !urgent && calm {
-            if let Some((gx, gy, take)) = self.pick_loot(o) {
+            if let Some((gx, gy, take, drop, _)) = self.pick_loot(o) {
                 mode = Mode::Loot;
                 goal = Some((gx, gy));
                 want_take = take;
+                want_drop = drop;
             } else if let Some((gx, gy)) = self.pick_drop(o, &enemies) {
                 mode = Mode::Drop;
                 goal = Some((gx, gy));
@@ -420,12 +534,18 @@ impl Bot {
                 // strafe perpendicular, keep preferred distance
                 if o.t > self.strafe_t {
                     self.strafe_sign = if self.rng.f() < 0.5 { -1.0 } else { 1.0 };
-                    self.strafe_t = o.t + 0.8 + self.rng.f() * 1.2;
+                    self.strafe_t = o.t + self.tune.strafe_min + self.rng.f() * (self.tune.strafe_max - self.tune.strafe_min).max(0.0);
                 }
                 let to = [(tg.pos[0] - pos[0]) / d.max(0.1), (tg.pos[1] - pos[1]) / d.max(0.1)];
                 let perp = [-to[1] * self.strafe_sign, to[0] * self.strafe_sign];
                 let pref = self.preferred_range(me);
-                let radial = if d < pref - 10.0 { -0.6 } else if d > pref + 20.0 { 0.5 } else { 0.0 };
+                let radial = if d < pref - 10.0 {
+                    -0.6
+                } else if d > pref + 20.0 {
+                    if self.tune.aggressive { 1.5 } else { 0.5 }
+                } else {
+                    0.0
+                };
                 let mut dir = [perp[0] + to[0] * radial, perp[1] + to[1] * radial];
                 // keep inside the zone
                 if !self.point_safe(o, pos[0] + dir[0] * 15.0, pos[1] + dir[1] * 15.0, 5.0, 5.0) {
@@ -448,17 +568,44 @@ impl Bot {
                     }
                 }
             }
+            Mode::Cover => {
+                if let Some((gx, gy)) = self.find_cover(o, &cover_from, None) {
+                    let (m, b, j) = self.go_to(o, gx, gy);
+                    mv = m;
+                    boost = b;
+                    jump = j;
+                    if self.tune.zigzag {
+                        mv = self.zigzag(o, mv);
+                    }
+                }
+            }
             Mode::Retreat => {
                 let threat_pos: Vec<[f64; 3]> = enemies.iter().map(|e| e.pos).collect();
                 let tb = attacker_bearing;
                 if let Some((gx, gy)) = self.find_cover(o, &threat_pos, tb) {
-                    goal = Some((gx, gy));
+                    let dd = ((gx - pos[0]).powi(2) + (gy - pos[1]).powi(2)).sqrt();
+                    if dd <= self.tune.retreat_cover_max {
+                        goal = Some((gx, gy));
+                    }
                 }
                 if let Some(g) = goal {
                     let (m, b, j) = self.go_to(o, g.0, g.1);
                     mv = m;
                     boost = b || me.energy > 40.0;
                     jump = j;
+                    if self.tune.zigzag {
+                        mv = self.zigzag(o, mv);
+                    }
+                } else if let Some(tg) = target.clone() {
+                    // no cover close enough: keep fighting (strafe) instead of running in the open
+                    mode = Mode::Fight;
+                    let d = d2(tg.pos, pos).max(0.1);
+                    if o.t > self.strafe_t {
+                        self.strafe_sign = if self.rng.f() < 0.5 { -1.0 } else { 1.0 };
+                        self.strafe_t = o.t + self.tune.strafe_min + self.rng.f() * (self.tune.strafe_max - self.tune.strafe_min).max(0.0);
+                    }
+                    let to = [(tg.pos[0] - pos[0]) / d, (tg.pos[1] - pos[1]) / d];
+                    mv = self.walkable_dir(pos, [-to[1] * self.strafe_sign, to[0] * self.strafe_sign]);
                 } else if let Some(g) = self.zone_dir(o) {
                     mv = g;
                 }
@@ -520,6 +667,7 @@ impl Bot {
         }
         if want_take.is_some() {
             act.take = want_take;
+            act.drop = want_drop;
         }
         // silent movement when enemies are close and we're not in a hurry or fighting
         let enemy_near = enemies.iter().any(|e| d2(e.pos, pos) < 80.0)
@@ -530,7 +678,9 @@ impl Bot {
 
         // ---------------- stuck detection / recovery
         let cmd_speed = (mv[0] * mv[0] + mv[1] * mv[1]).sqrt() * speed;
-        self.pos_hist.push_back((o.t, pos, cmd_speed));
+        let act_speed = (me.vel[0] * me.vel[0] + me.vel[1] * me.vel[1]).sqrt();
+        let cmd_speed = if mode == Mode::Fight { 0.0 } else { cmd_speed };
+        self.pos_hist.push_back((o.t, pos, cmd_speed, act_speed));
         while let Some(f) = self.pos_hist.front() {
             if o.t - f.0 > 1.6 {
                 self.pos_hist.pop_front();
@@ -550,6 +700,13 @@ impl Bot {
                 self.stuck_count = 1;
             }
             self.last_stuck_t = o.t;
+            if mode == Mode::Hold {
+                if let (Some(w), Some((_, tag))) = (self.world, self.hold_spot) {
+                    if let Some(c) = w.nearest_standable(pos[0] as f32, pos[1] as f32, pos[2] as f32, 2) {
+                        self.hold_spot = Some((c, tag));
+                    }
+                }
+            }
             let base = if (mv[0] * mv[0] + mv[1] * mv[1]) > 0.01 { mv } else { self.last_move };
             let ang = base[1].atan2(base[0]);
             let off = match self.stuck_count % 4 {
@@ -588,6 +745,21 @@ impl Bot {
         act
     }
 
+    /// Add a sideways weave to a travel direction so leading shooters miss.
+    fn zigzag(&mut self, o: &Obs, mv: [f64; 2]) -> [f64; 2] {
+        if o.t > self.strafe_t {
+            self.strafe_sign = -self.strafe_sign;
+            self.strafe_t = o.t + 0.5 + self.rng.f() * 0.6;
+        }
+        let n = (mv[0] * mv[0] + mv[1] * mv[1]).sqrt();
+        if n < 1e-6 {
+            return mv;
+        }
+        let f = [mv[0] / n, mv[1] / n];
+        let side = [-f[1] * self.strafe_sign, f[0] * self.strafe_sign];
+        self.walkable_dir(o.me.pos, [f[0] + side[0] * 0.8, f[1] + side[1] * 0.8])
+    }
+
     fn preferred_range(&self, me: &SelfObs) -> f64 {
         let has = |k: &str| me.weapons.iter().flatten().any(|w| w.kind == k);
         if has("lightning") {
@@ -618,7 +790,10 @@ impl Bot {
         let expected = avg_cmd * self.walk_speed * span;
         let moved = d2(f.1, o.me.pos);
         let dz = (f.1[2] - o.me.pos[2]).abs();
-        moved < (0.18 * expected).max(0.8) && dz < 1.5
+        let avg_speed: f64 = self.pos_hist.iter().map(|h| h.3).sum::<f64>() / self.pos_hist.len() as f64;
+        // either not moving at all, or going nowhere (oscillating) at a fraction of the commanded speed
+        let slow = avg_speed < 0.2 * avg_cmd * self.walk_speed;
+        moved < (0.18 * expected).max(0.8) && dz < 1.5 && (slow || moved < 0.5)
     }
 
     // ------------------------------------------------------------------ movement helpers
@@ -766,10 +941,12 @@ impl Bot {
         if d < prec {
             return ([0.0, 0.0], false, false);
         }
-        if d < 3.0 && self.climbing.is_none() {
+        let tz = w.cell_of(gx as f32, gy as f32).map(|c| w.floor[c] as f64).unwrap_or(pos[2]);
+        let same_level = (tz - pos[2]).abs() < w.p.step_up as f64;
+        if d < 3.0 && self.climbing.is_none() && same_level {
             return (direct, false, false);
         }
-        if self.climbing.is_none() && w.walkable_line((pos[0] as f32, pos[1] as f32), (gx as f32, gy as f32)) {
+        if self.climbing.is_none() && same_level && w.walkable_line((pos[0] as f32, pos[1] as f32), (gx as f32, gy as f32)) {
             return (direct, false, false);
         }
         let replan = match self.local_goal {
@@ -882,12 +1059,12 @@ impl Bot {
     }
 
     /// Loot target: (x, y, take id).
-    fn pick_loot(&mut self, o: &Obs) -> Option<(f64, f64, Option<u64>)> {
+    fn pick_loot(&mut self, o: &Obs) -> Option<(f64, f64, Option<u64>, Option<u32>, i64)> {
         let me = &o.me;
         let pos = me.pos;
         let held: Vec<String> = me.weapons.iter().flatten().map(|w| w.kind.clone()).collect();
         let slot1_empty = me.weapons.get(1).map(|w| w.is_none()).unwrap_or(true);
-        let mut best: Option<(f64, f64, f64, Option<u64>)> = None;
+        let mut best: Option<(f64, f64, f64, Option<u64>, Option<u32>, i64)> = None;
         for p in &o.pickups {
             if self.blocked_pickups.contains_key(&(p.id as i64)) {
                 continue;
@@ -913,11 +1090,15 @@ impl Bot {
             }
             let score = d - rank as f64 * 15.0;
             let take = if d < self.pickup_r - 0.3 && dz < 3.5 { Some(p.id as u64) } else { None };
+            let drop = if slot1_empty { None } else { Some(1u32) };
             if best.as_ref().map(|b| score < b.2).unwrap_or(true) {
-                best = Some((p.pos[0], p.pos[1], score, take));
+                best = Some((p.pos[0], p.pos[1], score, take, drop, p.id as i64));
             }
         }
         for c in &o.cubes {
+            if self.blocked_pickups.contains_key(&(c.id as i64)) {
+                continue;
+            }
             let d = d2(c.pos, pos);
             let dz = (c.pos[2] - pos[2]).abs();
             if d > 60.0 || dz > 6.0 {
@@ -928,13 +1109,22 @@ impl Bot {
             }
             let score = d - 10.0;
             if best.as_ref().map(|b| score < b.2).unwrap_or(true) {
-                best = Some((c.pos[0], c.pos[1], score, None));
+                best = Some((c.pos[0], c.pos[1], score, None, None, c.id as i64));
             }
         }
-        best.map(|b| (b.0, b.1, b.3)).map(|(x, y, take)| {
-            // swap: when slot 1 holds something worse, drop it in the same action
-            (x, y, take)
-        })
+        let b = best?;
+        // give up on a target that takes too long (unreachable, contested, or not takeable)
+        match self.loot_target {
+            Some((id, t0)) if id == b.5 => {
+                if o.t - t0 > 14.0 {
+                    self.blocked_pickups.insert(id, o.t + 60.0);
+                    self.loot_target = None;
+                    return None;
+                }
+            }
+            _ => self.loot_target = Some((b.5, o.t)),
+        }
+        Some((b.0, b.1, b.3, if b.3.is_some() { b.4 } else { None }, b.5))
     }
 
     fn pick_drop(&self, o: &Obs, enemies: &[Track]) -> Option<(f64, f64)> {
@@ -973,6 +1163,9 @@ impl Bot {
                 return Some((x as f64, y as f64));
             }
         }
+        if !self.ff_ready || Instant::now() + std::time::Duration::from_millis(9) > self.deadline {
+            return None; // not now: stand still this decision, search next time
+        }
         let pos = o.me.pos;
         let (cx, cy, r, _) = self.zone_target(o);
         let r = r.max(self.ff.radius as f64);
@@ -980,32 +1173,29 @@ impl Bot {
             Some(c) if w.standable(c) && (w.floor[c] as f64 - pos[2]).abs() < 2.0 => c,
             _ => w.nearest_standable(pos[0] as f32, pos[1] as f32, pos[2] as f32, 4)?,
         };
-        // BFS over walkable 8-neighbour edges within 40 m
+        // BFS over walkable 8-neighbour edges within 45 m
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut q = VecDeque::new();
         seen.insert(start);
         q.push_back(start);
         let (sx, sy) = w.cell_xy(start);
-        let mut best = start;
-        let mut bs = f64::MIN;
+        let mut cands: Vec<(f64, usize)> = Vec::new();
         while let Some(u) = q.pop_front() {
             let (x, y) = w.cell_xy(u);
             let dme = (((x - sx).powi(2) + (y - sy).powi(2)) as f64).sqrt();
             let dc = ((x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)).sqrt();
             if dc <= r * 0.9 {
                 let wall = match w.wdist[u] {
-                    1 | 2 => 12.0,
-                    3 => 6.0,
+                    1 => 4.0,
+                    2 | 3 => 8.0,
+                    4 => 4.0,
                     _ => 0.0,
                 };
-                let cover = w.cover[u] as f64 / 255.0 * 15.0;
-                let sc = wall + cover - dme * 0.3 - (dc / r.max(1.0)) * 5.0;
-                if sc > bs {
-                    bs = sc;
-                    best = u;
-                }
+                let cover = w.cover[u] as f64 / 255.0 * 12.0;
+                let sc = wall + cover - dme * 0.15 - (dc / r.max(1.0)) * 4.0;
+                cands.push((sc, u));
             }
-            if seen.len() > 6000 {
+            if seen.len() > 8000 {
                 continue;
             }
             let ui = (u % w.nx) as i32;
@@ -1021,7 +1211,7 @@ impl Bot {
                     continue;
                 }
                 let (vx, vy) = w.cell_xy(v);
-                if ((vx - sx).powi(2) + (vy - sy).powi(2)) > 40.0 * 40.0 {
+                if ((vx - sx).powi(2) + (vy - sy).powi(2)) > 45.0 * 45.0 {
                     continue;
                 }
                 if w.walk_cost(u, v, len).is_some() {
@@ -1030,9 +1220,49 @@ impl Bot {
                 }
             }
         }
+        if cands.is_empty() {
+            self.hold_spot = Some((start, self.ff.tag));
+            let (x, y) = w.cell_xy(start);
+            return Some((x as f64, y as f64));
+        }
+        // evaluate concealment for the most promising candidates plus a spread sample
+        cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let mut eval: Vec<(f64, usize)> = cands.iter().take(60).cloned().collect();
+        let stride = (cands.len() / 40).max(1);
+        eval.extend(cands.iter().step_by(stride).take(40).cloned());
+        let mut best = eval[0].1;
+        let mut bs = f64::MIN;
+        for &(sc, c) in &eval {
+            let hidden = self.concealment(w, c);
+            let total = sc + hidden * 3.0;
+            if total > bs {
+                bs = total;
+                best = c;
+            }
+        }
         self.hold_spot = Some((best, self.ff.tag));
         let (x, y) = w.cell_xy(best);
         Some((x as f64, y as f64))
+    }
+
+    /// How many of 16 far viewpoints (8 directions x 70/120 m, eye 8 m above ground) would NOT
+    /// see a mech standing on cell c.
+    fn concealment(&self, w: &World, c: usize) -> f64 {
+        let (x, y) = w.cell_xy(c);
+        let feet = [x, y, w.floor[c]];
+        let mut hidden = 0.0;
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::PI / 4.0 + 0.2;
+            for &dist in &[70.0f32, 120.0] {
+                let ex = x + a.cos() * dist;
+                let ey = y + a.sin() * dist;
+                let ez = w.ground(ex, ey) + 8.0;
+                if !w.mech_visible([ex, ey, ez], feet, self.mech_h as f32, 0.0) {
+                    hidden += 1.0;
+                }
+            }
+        }
+        hidden
     }
 
     /// Cover from threats: a nearby standable spot with no line of sight from any threat.
@@ -1099,7 +1329,7 @@ impl Bot {
             let d = d2(tg.pos, pos);
             let center = [tg.pos[0], tg.pos[1], tg.pos[2] + 4.5];
             let los = has_los(muzzle, center) || has_los(muzzle, [tg.pos[0], tg.pos[1], tg.pos[2] + 7.5]);
-            let shoot_ok = mode == Mode::Fight || mode == Mode::Retreat || (o.t - tg.hurt_us_t < 4.0) || d < 50.0;
+            let shoot_ok = mode == Mode::Fight || mode == Mode::Retreat || mode == Mode::Cover || (o.t - tg.hurt_us_t < 4.0) || d < 50.0 || self.tune.aggressive;
             if shoot_ok {
                 engaged = true;
                 // choose weapon per slot
@@ -1251,7 +1481,7 @@ impl Bot {
     }
 
     fn crate_shot(&self, o: &Obs) -> Option<(i64, [f64; 3])> {
-        if o.t > 240.0 {
+        if o.t > 240.0 || !self.tune.crates {
             return None;
         }
         if self.tracks.values().any(|t| !t.is_npc && o.t - t.seen_t < 3.0) || o.t - self.last_hurt_t < 6.0 {

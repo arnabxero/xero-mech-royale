@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
     Ours,
+    Aggro,
     Example,
     Rusher,
     Camper,
@@ -59,6 +60,14 @@ pub struct SimMech {
     pub dmg_taken: f64,
     pub zone_dmg: f64,
     pub laser_charging: bool,
+    pub killer: Option<usize>,
+    pub mode_at_death: String,
+    /// seconds during which at least one living enemy could see this mech
+    pub seen_s: f64,
+    /// seconds alive
+    pub alive_s: f64,
+    /// mode histogram (seconds) for bots
+    pub modes: HashMap<String, f64>,
 }
 
 struct Bullet {
@@ -148,7 +157,21 @@ impl<'a> Ffa<'a> {
         }
         let mut mechs = Vec::new();
         for (i, k) in kinds.iter().enumerate() {
-            let bot = if *k == Kind::Ours { Some(Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64)) } else { None };
+            let bot = match k {
+                Kind::Ours => {
+                    let mut b = Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
+                    if let Ok(spec) = std::env::var("XERO_TUNE") {
+                        b.tune.apply(&spec);
+                    }
+                    Some(b)
+                }
+                Kind::Aggro => {
+                    let mut b = Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
+                    b.tune = crate::bot::Tune::aggressive();
+                    Some(b)
+                }
+                _ => None,
+            };
             let aim0 = rng.f() * 6.28 - 3.14;
             mechs.push(SimMech {
                 id: i,
@@ -174,6 +197,11 @@ impl<'a> Ffa<'a> {
                 dmg_taken: 0.0,
                 zone_dmg: 0.0,
                 laser_charging: false,
+                killer: None,
+                mode_at_death: String::new(),
+                seen_s: 0.0,
+                alive_s: 0.0,
+                modes: HashMap::new(),
             });
         }
         // floor loot: laser / lightning (mortar not simulated yet)
@@ -216,20 +244,8 @@ impl<'a> Ffa<'a> {
             }
         }
         let e = self.eye(a);
-        let c = [b.body.pos[0], b.body.pos[1], b.body.pos[2] + 4.5];
-        let top = [b.body.pos[0], b.body.pos[1], b.body.pos[2] + 8.8];
         let f = |p: [f64; 3]| [p[0] as f32, p[1] as f32, p[2] as f32];
-        let los = self.w.los(f(e), f(c)) || self.w.los(f(e), f(top));
-        if !los {
-            return false;
-        }
-        if !near {
-            // canopy: dense crowns along the line hide the target
-            if self.w.canopy_along(f(e), f(c)) > 3.0 {
-                return false;
-            }
-        }
-        true
+        self.w.mech_visible(f(e), f(b.body.pos), 9.0, 45.0)
     }
 
     fn hear(&mut self, from: [f64; 3], kind: &str, range: f64, except: usize) {
@@ -416,6 +432,7 @@ impl<'a> Ffa<'a> {
             a.events.push(Event { kind: "hit".into(), target: Some(target as f64), amount: Some(amt), weapon: Some(weapon.into()), ..Default::default() });
         }
         if self.mechs[target].hp <= 0.0 {
+            self.mechs[target].killer = Some(by);
             self.kill(target, false);
             self.mechs[by].kills += 1;
             self.mechs[by].events.push(Event { kind: "kill".into(), target: Some(target as f64), ..Default::default() });
@@ -435,6 +452,7 @@ impl<'a> Ffa<'a> {
             return;
         }
         m.alive = false;
+        m.mode_at_death = m.bot.as_ref().map(|b| b.label.clone()).unwrap_or_default();
         m.place = self.alive;
         m.death_t = self.t;
         m.killed_by_zone = zone;
@@ -454,7 +472,19 @@ impl<'a> Ffa<'a> {
                     continue;
                 }
                 let o = self.obs_for(i);
-                let act = if self.mechs[i].kind == Kind::Ours {
+                if self.mechs[i].kind == Kind::Ours {
+                    let seen = (0..n).any(|j| j != i && self.mechs[j].alive && self.can_see(j, i));
+                    let m = &mut self.mechs[i];
+                    m.alive_s += 0.1;
+                    if seen {
+                        m.seen_s += 0.1;
+                    }
+                    if let Some(b) = m.bot.as_ref() {
+                        let md = format!("{:?}", b.mode);
+                        *m.modes.entry(md).or_insert(0.0) += 0.1;
+                    }
+                }
+                let act = if self.mechs[i].bot.is_some() {
                     let t0 = Instant::now();
                     let b = self.mechs[i].bot.as_mut().unwrap();
                     b.act(&o, t0 + Duration::from_millis(self.budget_ms))
@@ -470,10 +500,20 @@ impl<'a> Ffa<'a> {
                         if !have {
                             let slot = act.drop.map(|d| d as usize).or_else(|| m.weapons.iter().position(|w| w.is_none()));
                             if let Some(s) = slot {
+                                let old = m.weapons[s].take();
                                 m.weapons[s] = Some(SimWeapon::of(&kind));
                                 m.events.push(Event { kind: "took".into(), id: Some(serde_json::Value::from(id)), wkind: Some(kind.clone()), slot: Some(s as f64), ..Default::default() });
+                                let ppos = self.pickups[k].pos;
                                 self.pickups.remove(k);
+                                if let Some(ow) = old {
+                                    let nid = 9000 + self.rng.next_u64() % 100000;
+                                    self.pickups.push(Pickup { id: nid, kind: ow.kind, pos: ppos });
+                                }
+                            } else {
+                                m.events.push(Event { kind: "take_failed".into(), id: Some(serde_json::Value::from(id)), reason: Some("full".into()), ..Default::default() });
                             }
+                        } else {
+                            self.mechs[i].events.push(Event { kind: "take_failed".into(), id: Some(serde_json::Value::from(id)), reason: Some("have".into()), ..Default::default() });
                         }
                     }
                 }

@@ -1,54 +1,62 @@
-# STATUS: xero-mech (Team-Xero, Mech Royale)
+# STATUS: xero-mech (Mech Royale)
 
-_Last updated: Fri 2026-11-20 evening (v1)_
+_Last updated: Fri 2026-11-20 night (v2)_
+
+## Versions
+| Version | Commit | Practice (48 vs house squad) | Notes |
+| --- | --- | --- | --- |
+| v1 | 232756c | **2.63** (rank 45/51) | first robust version: nav + basic combat |
+| v2 | see `git log` (the "v2:" commit) | pending | concealment hold spots, canopy model, engagement policy, loot/stuck fixes |
 
 ## Submittable?
 **Yes.** The `Dockerfile` at the top level builds the Rust bot and passes the sandboxed `check.py`.
 
-## Conformance (check.py)
+## Conformance (check.py), v2
 | Run | Result | answer time ms (p50 / p90 / p99 / max) |
 | --- | --- | --- |
-| Local (Windows, release exe), 14 ms slice | PASS 300/300 in time | 0.1 / 0.3 / 14.3 / 14.4 |
-| Docker sandbox (`--network none --cpus 1 --memory 512m --read-only --tmpfs /tmp --user 65534:65534`), 18 ms slice | PASS 300/300 in time, 0 late | 0.9 / 1.2 / 19.7 / 21.1 |
+| Local (Windows release exe) | PASS 300/300 in time | 0.2 / 0.4 / 14.4 / 14.5 |
+| Docker sandbox (`--network none --cpus 1 --memory 512m --read-only --tmpfs /tmp --user 65534:65534`) | PASS 300/300 in time, 0 late | 1.0 / 1.2 / 15.9 / 16.7 |
 
-- `ready` arrives in ~0.2 s locally and ~0.4 s in Docker. The world build takes ~250 ms.
-- The p99 comes from the time-sliced Dijkstra flow field (it fills its slice budget). Normal
-  decisions take ~0.1-0.6 ms.
+- `ready` arrives in ~0.4 s in Docker. The world build takes ~170 ms.
+- The p99 comes from the time-sliced Dijkstra flow field, which runs last in each decision and
+  stops at 14 ms after the observation arrived. Normal decisions take ~0.1-1 ms.
 
-## What works
-- World model: terrain, prisms on a 1 m grid, floor layer (roofs, decks, walk-under bridges),
-  standability with mech clearance, 180k jump edges (jet climbs up to 45 m, drops), LOS, canopy cover.
-- Zone flow fields (time-sliced Dijkstra, ~120 ms total) to an inner disc of the next circle.
-  The disc grows when the circle is on roofs or off the map.
-- Path following with string pulling, climb maneuvers, and stuck recovery (jump+jet, then side-steps).
-- Final phase: tracks the moving center of the last circle to within 0.3 m.
-- Hold spots reachable on foot, chosen by BFS: next to a wall and/or under canopy.
-- Combat: gun lead, lightning cone, laser charge/release, mortar ballistic (high arc without LOS),
-  strafing, facing the attacker, retreating to cover at low HP.
-- Loot (weapons, cubes), crates (shoot when calm and early), supply drops (only uncontested),
-  and upgrade priorities.
+## Changes in v2 (vs v1)
+- **Canopy model**: exact segment-vs-ellipsoid crown path length from `world.json` trees. A sight
+  line is blocked by more than ln(1/canopyBlockT)/canopyDensity ≈ 4 m of foliage (beyond the 45 m
+  near range).
+- **Concealed hold spots**: among cells reachable on foot (BFS, 45 m), score how many of 16 far
+  viewpoints (8 directions x 70/120 m) can't see us, plus wall proximity and canopy. The search is
+  deadline-aware.
+- **Engagement policy** (tunable `Tune`): fight when <55 m, when attacked and healthy within 90 m,
+  or when the enemy is weak. Otherwise, against a far attacker, go to cover (break LOS) and shoot
+  back while moving. Retreat to cover at low HP.
+- **Fixes**:
+  - Stuck detection no longer fires while strafing in a fight. It now compares actual speed with
+    commanded speed.
+  - Loot: weapon swaps send `drop`; a loot target that takes more than 14 s is blacklisted.
+  - "Go direct" shortcut no longer skips roof climbs.
+  - A hold spot that gets the bot stuck is replaced by the current cell.
 
-## Smoke simulator (`target/release/sim nav N SEED`)
-Approximate physics, one mech, random spawn, server-like zone schedule (centers kept on the map).
-- 30/30 runs survive until the final circle closes (radius 0 at 415 s, when everyone takes 260 dps).
-  Final distance to the end point is 0.1-0.4 m.
-- Stuck events (>3 s without progress while moving): 10 across 30 matches, all recovered.
-  The longest was 4.2 s.
-- Worst decision in the sim is 18-24 ms (the flow-field slice).
+## Simulators
+- `sim nav N SEED`: navigation smoke test (one mech, approximate physics, server-like zone).
+  v2: 30/30 runs alive until the final circle closes, 9 stuck events (max 5.1 s), worst decision 20.6 ms.
+- `sim ffa N SEED OURS MIX` and `tools/bench.sh RUNS PROCS OURS MIX [SEED]` (parallel). Mixes:
+  - `mixed`: kit-example-like / rusher / camper scripted bots.
+  - `aggro`: 15 copies of our own bot with an aggressive tune. These navigate well, lead shots,
+    and engage anything within 200 m.
 
-## FFA simulator (`target/release/sim ffa N SEED OURS MIX`)
-16 mechs. The scripted opponents are kit-example-like ("example"), "rusher" and "camper". Guns
-have travel time and spread; vision uses FOV, near sensors, LOS, approximate canopy and 5 s
-memory; lasers and lightning are floor loot. The opponents are dumb, so these numbers are optimistic.
-- v1, 1 ours vs mixed, 60 matches: **mean score 8.85**, 12 wins.
-- v1, 4 ours vs mixed, 30 matches: 8.83 per bot.
-- v1, 1 ours vs rushers, 30 matches: 11.03.
+| Bench | v1 | v2 |
+| --- | --- | --- |
+| 1 ours vs mixed, 200 matches | 8.85 (60 matches) | **9.67** (44 wins) |
+| 1 ours vs 15 aggro, 100 matches | 7.94 (80 matches) | **8.69** |
+
+(Random placement = 7.5. The SE of the mean is about 0.35 at 200 matches and 0.45 at 100.)
 
 ## Known weaknesses / TODO
-- Combat tuning is untested against real bots. Fight/flee thresholds are guesses.
+- Practice is a duel test: the squad sends 1 hunter at first, more as we kill them, all of them
+  late. Squad bots don't kill each other, so points ≈ hunters that die before us. The **duel**
+  needs improving: weapon pickups early (lightning/laser), cubes, cover use.
 - No projectile dodging and no dodging of enemy laser telegraphs yet.
-- Sound reasoning is minimal: the bot only faces recent sounds.
-- Mortar is not modelled in the FFA sim. Self-splash avoidance for our own mortar is crude
-  (minimum range 22 m only).
-- Rooftop camping is not used (jump edges exist, but hold spots are ground/BFS only).
-- Upgrade choice is a fixed priority list.
+- The mortar is not modelled in the FFA sim.
+- Upgrade choice is a fixed priority list (plating > armor > nanites > ...).
