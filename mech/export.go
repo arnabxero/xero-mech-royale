@@ -1,4 +1,1 @@
-package mech
-
-func (b *Brain) Travel(me *Self, gx, gy float64) (float64, float64) { return b.travel(me, gx, gy) }
-func (b *Brain) SetNow(t float64)                                   { b.now = t }
+{"message":"Not Found","documentation_url":"https://docs.github.com/rest/repos/contents#get-repository-content","status":"404"}
