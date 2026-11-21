@@ -53,6 +53,7 @@ pub struct SimMech {
     pub seen: HashMap<usize, f64>,
     pub events: Vec<Event>,
     pub sounds: Vec<SoundObs>,
+    pub beams: Vec<BeamObs>,
     pub act: Action,
     pub bot: Option<Bot>,
     pub step_t: f64,
@@ -218,6 +219,7 @@ impl<'a> Ffa<'a> {
                 seen: HashMap::new(),
                 events: vec![],
                 sounds: vec![],
+                beams: vec![],
                 act: Action::default(),
                 bot,
                 step_t: 0.0,
@@ -250,7 +252,7 @@ impl<'a> Ffa<'a> {
             }
         }
         let n = mechs.len();
-        let mut f = Ffa { w, cfg, ph, zs, mechs, bullets: vec![], pickups, t: 0.0, tick: 0, rng, alive: n, budget_ms: 18, log: false, hunters: vec![], all_hunt_t: 300.0 };
+        let mut f = Ffa { w, cfg, ph, zs, mechs, bullets: vec![], pickups, t: 0.0, tick: 0, rng, alive: n, budget_ms: 18, log: std::env::var("FFA_TRACE").is_ok(), hunters: vec![], all_hunt_t: 300.0 };
         f.add_hunter();
         if f.mechs.len() == 2 {
             for m in f.mechs.iter_mut() {
@@ -381,10 +383,25 @@ impl<'a> Ffa<'a> {
                 projectiles.push(ProjObs { id: k as f64, kind: "gun".into(), pos: b.pos, vel: b.vel });
             }
         }
+        // pickups follow the vision rules: 45 m all around, or 200 m inside the 120 deg FOV, with LOS
+        let eye = [me.body.pos[0] as f32, me.body.pos[1] as f32, (me.body.pos[2] + 8.0) as f32];
+        let aim_yaw = me.aim[0];
         let pickups: Vec<PickupObs> = self
             .pickups
             .iter()
-            .filter(|p| dist2(p.pos, me.body.pos) < 120.0)
+            .filter(|p| {
+                let d = dist2(p.pos, me.body.pos);
+                if d > 200.0 {
+                    return false;
+                }
+                if d > 45.0 {
+                    let yaw = (p.pos[1] - me.body.pos[1]).atan2(p.pos[0] - me.body.pos[0]);
+                    if wrap(yaw - aim_yaw).abs() > 60f64.to_radians() {
+                        return false;
+                    }
+                }
+                self.w.los(eye, [p.pos[0] as f32, p.pos[1] as f32, p.pos[2] as f32 + 0.5])
+            })
             .map(|p| PickupObs { id: p.id as f64, kind: p.kind.clone(), pos: p.pos })
             .collect();
         let in_zone = ((me.body.pos[0] - zc[0]).powi(2) + (me.body.pos[1] - zc[1]).powi(2)).sqrt() <= zr;
@@ -415,6 +432,7 @@ impl<'a> Ffa<'a> {
             pickups,
             sounds: std::mem::take(&mut me.sounds),
             events: std::mem::take(&mut me.events),
+            beams: std::mem::take(&mut me.beams),
             zone,
             ..Default::default()
         }
@@ -613,6 +631,32 @@ impl<'a> Ffa<'a> {
                 self.mechs[i].act = act;
             }
         }
+        if decide && self.log && self.tick % 4 == 0 {
+            let ours: Vec<usize> = (0..n).filter(|&i| self.mechs[i].kind == Kind::Ours && self.mechs[i].alive).collect();
+            for &i in &ours {
+                let m = &self.mechs[i];
+                let mut line = format!(
+                    "t={:.1} ours hp={:.0} pos=({:.0},{:.0},{:.0}) aim={:.2} {} fire={:?} mv=({:.2},{:.2})",
+                    self.t, m.hp, m.body.pos[0], m.body.pos[1], m.body.pos[2], m.aim[0], m.bot.as_ref().map(|b| b.label.clone()).unwrap_or_default(), m.act.fire, m.act.r#move[0], m.act.r#move[1]
+                );
+                for j in 0..n {
+                    if j == i || !self.mechs[j].alive {
+                        continue;
+                    }
+                    let e = &self.mechs[j];
+                    let d = dist2(e.body.pos, m.body.pos);
+                    if d > 260.0 {
+                        continue;
+                    }
+                    line += &format!(
+                        " | #{j} {:?} d={:.0} hp={:.0} we_see={} it_sees={} charging={} {}",
+                        e.kind, d, e.hp, self.can_see(i, j) as u8, self.can_see(j, i) as u8, e.laser_charging as u8,
+                        e.bot.as_ref().map(|b| b.label.clone()).unwrap_or_default()
+                    );
+                }
+                eprintln!("{line}");
+            }
+        }
         // movement, aim, weapons
         let zone = self.zs.obs(self.t);
         let (zc, zr) = zone.at(self.t);
@@ -740,11 +784,23 @@ impl<'a> Ffa<'a> {
                         }
                     }
                     self.hear(muzzle, "laser", 380.0, i);
+                    let mut end = [start[0] + dir[0] * 280.0, start[1] + dir[1] * 280.0, start[2] + dir[2] * 280.0];
                     if let Some((j, tt)) = best {
                         let hit = [start[0] + dir[0] * tt, start[1] + dir[1] * tt, start[2] + dir[2] * tt];
                         let f = |p: [f64; 3]| [p[0] as f32, p[1] as f32, p[2] as f32];
                         if self.w.los(f(start), f(hit)) {
+                            end = hit;
                             self.damage(j, i, dmg, "laser", [dir[0], dir[1]]);
+                        }
+                    }
+                    // beam seen by everyone near either end (incl. the victim)
+                    for k in 0..n {
+                        if k == i || !self.mechs[k].alive {
+                            continue;
+                        }
+                        let p = self.mechs[k].body.pos;
+                        if dist2(p, muzzle) < 45.0 || dist2(p, end) < 45.0 {
+                            self.mechs[k].beams.push(BeamObs { by: i as f64, kind: "laser".into(), path: vec![muzzle, end], age: 0.0 });
                         }
                     }
                 }

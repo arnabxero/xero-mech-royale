@@ -1,26 +1,44 @@
 # STATUS: xero-mech (Mech Royale)
 
-_Last updated: Fri 2026-11-20 night (v3)_
+_Last updated: Sat 2026-11-21 early (v4)_
 
 ## Versions
 | Version | Commit | Practice (48 vs house squad) | Notes |
 | --- | --- | --- | --- |
 | v1 | 232756c | **2.63** (rank 45/51) | first robust version: nav + basic combat |
 | v2 | 686ba81 | **2.67** (rank 48/79) | concealment hold spots, canopy model, engagement policy, loot/stuck fixes |
-| v3 | see `git log` (the "v3:" commit) | pending | laser-first loot, persistent cover + re-chosen hold spot, bullet/mortar dodging |
+| v3 / v3.1 | 4fded0d / afe5742 | pending (A) | laser-first loot, persistent cover + re-chosen hold spot, bullet/mortar dodging |
+| v3.1-duel | 81cb33a (branch variant-duel) | pending (B) | same + `ENV XERO_TUNE=solo_duel=1` |
+| v4 | see `git log` (the "v4:" commit) | not yet submitted | blind return fire (ghost tracks), laser-charge ducking, wall-at-back hold scanning, pickup memory + travel sweep |
 
 ## Submittable?
 **Yes.** The `Dockerfile` at the top level builds the Rust bot and passes the sandboxed `check.py`.
 
-## Conformance (check.py), v3
+## Conformance (check.py), v4
 | Run | Result | answer time ms (p50 / p90 / p99 / max) |
 | --- | --- | --- |
-| Local (Windows release exe) | PASS 300/300 in time | 0.2 / 0.4 / 14.4 / 14.5 |
-| Docker sandbox (`--network none --cpus 1 --memory 512m --read-only --tmpfs /tmp --user 65534:65534`) | PASS 300/300 in time, 0 late | 3.0 / 4.5 / 17.1 / 18.3 |
+| Local (Windows release exe) | PASS 300/300 in time | 0.2 / 0.4 / 14.4 / 14.4 |
+| Docker sandbox (`--network none --cpus 1 --memory 512m --read-only --tmpfs /tmp --user 65534:65534`) | PASS 300/300 in time, 0 late | 1.4 / 1.7 / 16.6 / 17.0 |
 
 - `ready` arrives in ~0.4 s in Docker. The world build takes ~170 ms.
 - The p99 comes from the time-sliced Dijkstra flow field, which runs last in each decision and
   stops at 14 ms after the observation arrived. Normal decisions take ~0.1-1 ms.
+
+## Changes in v4 (vs v3.1)
+- **Blind return fire / ghost tracks.** Duel traces showed the hunter killing us through tree
+  canopy. Trees block sight but not shots, so it could hit us while we couldn't see it. Laser and
+  lightning `beams` give the shooter's muzzle position, and `damaged` bearings give its direction.
+  Both create ghost tracks that we aim at and shoot (buildings still block, trees don't).
+- **Duck laser telegraphs.** When a visible enemy's laser is `charging` and aimed at us (within
+  ~6 m at our range), move to the nearest spot out of its LOS. The peek logic hides while their
+  laser charges, steps out to shoot during their cooldown, and pre-charges our own laser in cover.
+- **Back to the wall.** Hold spots record the open direction (away from walls within 9 m). While
+  holding, the torso sweeps +-70 deg around it instead of spinning 360 deg, so rear hits (x1.5) come
+  only through the wall side.
+- **Pickup memory + travel sweep.** Weapon pickups seen once are remembered (forgotten when we're
+  within 30 m and don't see them, or after a `took`/`gone`). While travelling, the torso sweeps
+  +-60 deg around the heading to spot loot and threats.
+- Sim: pickups follow the vision rules; laser beams are emitted; per-tick duel trace (`FFA_TRACE=1`).
 
 ## Changes in v3 (vs v2)
 - **Loot priority laser > lightning > mortar.** The recorded practice stream shows the house hunter
@@ -60,10 +78,11 @@ _Last updated: Fri 2026-11-20 night (v3)_
   - `aggro`: 15 copies of our own bot with an aggressive tune. These navigate well, lead shots,
     and engage anything within 200 m.
 
-| Bench | v1 | v2 | v3 |
-| --- | --- | --- | --- |
-| 1 ours vs mixed, 200 matches | 8.85 (60 matches) | 9.67 (44 wins) | **10.75** (65 wins) |
-| 1 ours vs 15 aggro, 100 matches | 7.94 (80 matches) | 8.69 | **9.40** |
+| Bench | v1 | v2 | v3 | v4 |
+| --- | --- | --- | --- | --- |
+| 1 ours vs mixed, 200 matches | 8.85 (60 matches) | 9.67 (44 wins) | 10.75 (65 wins) | **10.86** (67 wins) |
+| 1 ours vs 15 aggro, 100 matches | 7.94 (80 matches) | 8.69 | 9.40 | |
+| 1 ours vs 15 aggro, 240 matches, seeds 60000 | | | 9.17 | **9.60** |
 | 1v1 vs gun hunter (`duelg`), win % | | | 46% |
 | 1v1 vs laser hunter (`duel`), win %, gun only | | | 8% (30% with a laser) |
 

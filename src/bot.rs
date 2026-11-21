@@ -23,6 +23,8 @@ pub struct Track {
     /// last time this mech damaged us
     pub hurt_us_t: f64,
     pub is_npc: bool,
+    /// position inferred (beam origin / damage bearing), not actually seen
+    pub ghost: bool,
 }
 
 /// Behaviour parameters (the survivor defaults are what ships; the simulator also runs an
@@ -59,6 +61,8 @@ pub struct Tune {
     pub cover_hold_s: f64,
     /// when only one enemy is around, duel it head-on (no cover runs, later retreat)
     pub solo_duel: bool,
+    /// peek-fight laser carriers: hide while their laser charges, shoot during its cooldown
+    pub peek: bool,
     /// sidestep incoming bullets and mortar impacts
     pub dodge: bool,
 }
@@ -82,6 +86,7 @@ impl Default for Tune {
             loot_radius: 70.0,
             cover_hold_s: 8.0,
             solo_duel: false,
+            peek: true,
             dodge: true,
         }
     }
@@ -126,6 +131,7 @@ impl Tune {
                 "loot_radius" => self.loot_radius = v,
                 "cover_hold_s" => self.cover_hold_s = v,
                 "solo_duel" => self.solo_duel = v != 0.0,
+                "peek" => self.peek = v != 0.0,
                 "dodge" => self.dodge = v != 0.0,
                 _ => eprintln!("unknown tune key {k}"),
             }
@@ -218,6 +224,7 @@ pub struct Bot {
     last_dealt_t: f64,
     sounds: VecDeque<(f64, f64, String, String)>, // t, bearing, dist band, kind
     hold_spot: Option<(usize, (i64, i64, i64))>,
+    hold_open: Option<f64>,
     strafe_sign: f64,
     strafe_t: f64,
     scan_yaw: f64,
@@ -226,6 +233,11 @@ pub struct Bot {
     pub t: f64,
     blocked_pickups: HashMap<i64, f64>,
     loot_target: Option<(i64, f64)>,
+    /// weapon pickups seen so far: id -> (kind, pos, last seen t)
+    pub known_pickups: HashMap<i64, (String, [f64; 3], f64)>,
+    /// peek pair: (hidden spot, exposed spot, target id, target pos when computed, t)
+    peek: Option<((f64, f64), (f64, f64), i64, [f64; 3], f64)>,
+    pub peeking: bool,
     cover_until: f64,
     cover_spot: Option<(f64, f64)>,
     cover_threats: Vec<[f64; 3]>,
@@ -273,6 +285,7 @@ impl Bot {
             last_dealt_t: -99.0,
             sounds: VecDeque::new(),
             hold_spot: None,
+            hold_open: None,
             strafe_sign: 1.0,
             strafe_t: 0.0,
             scan_yaw: 0.0,
@@ -281,6 +294,9 @@ impl Bot {
             t: 0.0,
             blocked_pickups: HashMap::new(),
             loot_target: None,
+            known_pickups: HashMap::new(),
+            peek: None,
+            peeking: false,
             cover_until: -1.0,
             cover_spot: None,
             cover_threats: Vec::new(),
@@ -314,6 +330,29 @@ impl Bot {
             e.seen_t = o.t;
             e.cubes = m.cubes.unwrap_or(0.0);
             e.is_npc = m.kind == "npc";
+            e.ghost = false;
+        }
+        // shooters we cannot see: laser/lightning beams start at the shooter's muzzle
+        let my_id = me.id as i64;
+        let muzzle_h = self.muzzle_h;
+        for b in &o.beams {
+            let id = b.by as i64;
+            if id == my_id || b.path.is_empty() {
+                continue;
+            }
+            let fresh = self.tracks.get(&id).map(|tr| !tr.ghost && o.t - tr.seen_t < 0.15).unwrap_or(false);
+            if fresh {
+                continue;
+            }
+            let p0 = b.path[0];
+            let e = self.tracks.entry(id).or_insert_with(|| Track { id, first_t: o.t, hp: 1400.0, max_hp: 1400.0, ..Default::default() });
+            e.pos = [p0[0], p0[1], p0[2] - muzzle_h];
+            e.vel = [0.0, 0.0, 0.0];
+            e.seen_t = o.t;
+            e.ghost = true;
+            if !e.weapons.iter().any(|w| *w == b.kind) {
+                e.weapons.push(b.kind.clone());
+            }
         }
         // forget stale tracks
         let t = o.t;
@@ -326,7 +365,35 @@ impl Bot {
                         self.last_hurt_t = t;
                     }
                     let by = ev.by.map(|b| b as i64);
-                    if let Some(b) = by {
+                    if let (Some(b), Some(bearing)) = (by, ev.bearing) {
+                        let me_pos = me.pos;
+                        let est = match w.as_str() {
+                            "lightning" => 30.0,
+                            "laser" => 130.0,
+                            "mortar" => 120.0,
+                            _ => 90.0,
+                        };
+                        let fresh = self.tracks.get(&b).map(|tr| o.t - tr.seen_t < 0.15).unwrap_or(false);
+                        if !fresh && b < 100 {
+                            let e = self.tracks.entry(b).or_insert_with(|| Track { id: b, first_t: t, hp: 1400.0, max_hp: 1400.0, ..Default::default() });
+                            // keep the last known distance if we had one, else a weapon-based guess
+                            let dist = if e.seen_t > 0.0 && t - e.seen_t < 20.0 {
+                                ((e.pos[0] - me_pos[0]).powi(2) + (e.pos[1] - me_pos[1]).powi(2)).sqrt().clamp(15.0, 220.0)
+                            } else {
+                                est
+                            };
+                            e.pos = [me_pos[0] + bearing.cos() * dist, me_pos[1] + bearing.sin() * dist, me_pos[2]];
+                            e.vel = [0.0, 0.0, 0.0];
+                            e.seen_t = t;
+                            e.ghost = true;
+                            if !e.weapons.iter().any(|x| *x == w) && w != "npc" {
+                                e.weapons.push(w.clone());
+                            }
+                        }
+                        if let Some(tr) = self.tracks.get_mut(&b) {
+                            tr.hurt_us_t = t;
+                        }
+                    } else if let Some(b) = by {
                         if let Some(tr) = self.tracks.get_mut(&b) {
                             tr.hurt_us_t = t;
                         }
@@ -362,6 +429,26 @@ impl Bot {
             }
         }
         self.blocked_pickups.retain(|_, until| *until > t);
+        // remember weapon pickups; forget ones that should be visible but are not
+        for p in &o.pickups {
+            self.known_pickups.insert(p.id as i64, (p.kind.clone(), p.pos, t));
+        }
+        let me_pos = o.me.pos;
+        let visible: Vec<i64> = o.pickups.iter().map(|p| p.id as i64).collect();
+        self.known_pickups.retain(|id, (_, pos, seen)| {
+            if visible.contains(id) {
+                return true;
+            }
+            let d = ((pos[0] - me_pos[0]).powi(2) + (pos[1] - me_pos[1]).powi(2)).sqrt();
+            d > 30.0 && t - *seen < 150.0
+        });
+        for ev in &o.events {
+            if ev.kind == "took" || (ev.kind == "take_failed" && ev.reason.as_deref() == Some("gone")) {
+                if let Some(id) = ev.id.as_ref().and_then(|v| v.as_f64()) {
+                    self.known_pickups.remove(&(id as i64));
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------ zone field
@@ -629,6 +716,14 @@ impl Bot {
                 let dir = self.walkable_dir(pos, dir);
                 mv = dir;
                 speed = 1.0;
+                self.peeking = false;
+                if self.tune.peek && tg.weapons.iter().any(|w| w == "laser") && d > 35.0 && d < 260.0 {
+                    if let Some((m, b)) = self.peek_move(o, &tg) {
+                        mv = m;
+                        boost = b;
+                        self.peeking = true;
+                    }
+                }
                 let has_lightning = me.weapons.iter().flatten().any(|w| w.kind == "lightning");
                 if self.tune.boost_strafe && d > 20.0 && me.grounded && me.energy > if has_lightning { 70.0 } else { 35.0 } {
                     boost = true;
@@ -758,6 +853,29 @@ impl Bot {
             || self.sounds.iter().any(|s| o.t - s.0 < 4.0 && s.2 == "near" && (s.3 == "step" || s.3 == "boost"));
         if enemy_near && !urgent && (mode == Mode::Hold || mode == Mode::Loot) {
             speed = speed.min(0.4);
+        }
+
+        // ---------------- duck an enemy laser that is charging at us
+        if self.tune.peek && !(mode == Mode::Rotate && urgent) {
+            let threat = enemies
+                .iter()
+                .filter(|e| e.charging && !e.ghost)
+                .filter(|e| {
+                    let yaw_to_us = (pos[1] - e.pos[1]).atan2(pos[0] - e.pos[0]);
+                    let d = d2(e.pos, pos);
+                    d > 30.0 && wrap(e.aim[0] - yaw_to_us).abs() < (6.0f64 / d.max(1.0)).atan() + 0.06
+                })
+                .min_by(|a, b| d2(a.pos, pos).partial_cmp(&d2(b.pos, pos)).unwrap())
+                .cloned();
+            if let Some(e) = threat {
+                if let Some((m, b)) = self.peek_move(o, &e) {
+                    if m[0] != 0.0 || m[1] != 0.0 {
+                        mv = m;
+                        speed = 1.0;
+                        boost = b || (me.grounded && me.energy > 20.0);
+                    }
+                }
+            }
         }
 
         // ---------------- dodge incoming mortar shells and bullets
@@ -1084,6 +1202,95 @@ impl Bot {
         self.follow_path(o, &p)
     }
 
+    /// Peek-fighting against a laser carrier: pick a hidden spot (no LOS from its eye) and an
+    /// exposed spot next to it; hide while its laser charges or is held, peek otherwise.
+    fn peek_move(&mut self, o: &Obs, tg: &Track) -> Option<([f64; 2], bool)> {
+        let w = self.world?;
+        let pos = o.me.pos;
+        let eye = [tg.pos[0] as f32, tg.pos[1] as f32, (tg.pos[2] + self.eye_h) as f32];
+        let exposed = |x: f64, y: f64, z: f64| -> bool {
+            w.los(eye, [x as f32, y as f32, (z + 4.5) as f32]) || w.los(eye, [x as f32, y as f32, (z + 8.5) as f32])
+        };
+        let recompute = match &self.peek {
+            Some((h, _, id, tp, t0)) => {
+                *id != tg.id
+                    || d2(*tp, tg.pos) > 12.0
+                    || o.t - t0 > 3.0
+                    || ((h.0 - pos[0]).powi(2) + (h.1 - pos[1]).powi(2)).sqrt() > 16.0
+            }
+            None => true,
+        };
+        if recompute {
+            let mut hidden: Vec<(f64, f64, f64)> = Vec::new();
+            let mut vis: Vec<(f64, f64)> = Vec::new();
+            for k in 0..24 {
+                let a = k as f64 * PI / 12.0;
+                for &r in &[0.0, 2.5, 5.0, 7.5, 10.0, 13.0] {
+                    if r == 0.0 && k > 0 {
+                        continue;
+                    }
+                    let x = pos[0] + a.cos() * r;
+                    let y = pos[1] + a.sin() * r;
+                    let c = match w.cell_of(x as f32, y as f32) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    if !w.standable(c) || (w.floor[c] as f64 - pos[2]).abs() > 1.5 {
+                        continue;
+                    }
+                    if r > 0.0 && !w.walkable_line((pos[0] as f32, pos[1] as f32), (x as f32, y as f32)) {
+                        continue;
+                    }
+                    let z = w.floor[c] as f64;
+                    if exposed(x, y, z) {
+                        vis.push((x, y));
+                    } else {
+                        hidden.push((x, y, r));
+                    }
+                }
+            }
+            // best pair: hidden spot close to us with an exposed spot within 6 m of it
+            let mut best: Option<((f64, f64), (f64, f64))> = None;
+            let mut bs = f64::MAX;
+            for &(hx, hy, hr) in &hidden {
+                for &(vx, vy) in &vis {
+                    let dv = ((hx - vx).powi(2) + (hy - vy).powi(2)).sqrt();
+                    if dv < 2.0 || dv > 6.5 {
+                        continue;
+                    }
+                    let sc = hr + dv * 0.8;
+                    if sc < bs {
+                        bs = sc;
+                        best = Some(((hx, hy), (vx, vy)));
+                    }
+                }
+            }
+            match best {
+                Some((h, v)) => self.peek = Some((h, v, tg.id, tg.pos, o.t)),
+                None => {
+                    self.peek = None;
+                    return None;
+                }
+            }
+        }
+        let (h, v, _, _, _) = self.peek?;
+        let me = &o.me;
+        let our_laser = me.weapons.iter().flatten().find(|w| w.kind == "laser");
+        let charging_ours = our_laser.map(|l| l.charge.unwrap_or(0.0) > 0.0).unwrap_or(false);
+        let our_full = our_laser.map(|l| l.charge.unwrap_or(0.0) >= l.stat("charge", 0.75) * 0.95).unwrap_or(false);
+        let hp_frac = me.hp / me.max_hp.max(1.0);
+        // hide while their laser is charged/charging, while ours is still charging, or to heal
+        let hide = tg.charging || (charging_ours && !our_full) || (hp_frac < 0.3 && tg.hp > me.hp);
+        let goal = if hide { h } else { v };
+        let dx = goal.0 - pos[0];
+        let dy = goal.1 - pos[1];
+        let d = (dx * dx + dy * dy).sqrt();
+        if d < 0.6 {
+            return Some(([0.0, 0.0], false));
+        }
+        Some(([dx / d, dy / d], hide && d > 2.0 && me.energy > 20.0))
+    }
+
     /// Direction to step to avoid a predicted mortar impact or an incoming bullet, if any.
     fn dodge_dir(&mut self, o: &Obs) -> Option<[f64; 2]> {
         let me = &o.me;
@@ -1245,7 +1452,12 @@ impl Bot {
         let held: Vec<String> = me.weapons.iter().flatten().map(|w| w.kind.clone()).collect();
         let slot1_empty = me.weapons.get(1).map(|w| w.is_none()).unwrap_or(true);
         let mut best: Option<(f64, f64, f64, Option<u64>, Option<u32>, i64)> = None;
-        for p in &o.pickups {
+        let known: Vec<PickupObs> = self
+            .known_pickups
+            .iter()
+            .map(|(id, (k, p, _))| PickupObs { id: *id as f64, kind: k.clone(), pos: *p })
+            .collect();
+        for p in &known {
             if self.blocked_pickups.contains_key(&(p.id as i64)) {
                 continue;
             }
@@ -1422,8 +1634,33 @@ impl Bot {
             }
         }
         self.hold_spot = Some((best, self.ff.tag));
+        self.hold_open = self.open_dir(w, best);
         let (x, y) = w.cell_xy(best);
         Some((x as f64, y as f64))
+    }
+
+    /// Direction away from nearby walls at cell c (None if no wall within 9 m).
+    fn open_dir(&self, w: &World, c: usize) -> Option<f64> {
+        let (x, y) = w.cell_xy(c);
+        let mut acc = [0.0f64, 0.0];
+        let mut hits = 0;
+        for k in 0..16 {
+            let a = k as f64 * PI / 8.0;
+            for r in [4.0f64, 6.0, 9.0] {
+                if let Some(n) = w.cell_of((x as f64 + a.cos() * r) as f32, (y as f64 + a.sin() * r) as f32) {
+                    if w.obstructs(n, w.floor[c]) {
+                        acc[0] -= a.cos() / r;
+                        acc[1] -= a.sin() / r;
+                        hits += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        if hits == 0 || acc[0].hypot(acc[1]) < 1e-6 {
+            return None;
+        }
+        Some(acc[1].atan2(acc[0]))
     }
 
     /// How many of 16 far viewpoints (8 directions x 70/120 m, eye 8 m above ground) would NOT
@@ -1567,7 +1804,7 @@ impl Bot {
                             if d < range * 0.97 {
                                 if charge <= 0.0 {
                                     // start charging only if cooled down and roughly aimed
-                                    if wo.cooldown <= 0.0 && err < 0.35 && los {
+                                    if wo.cooldown <= 0.0 && err < 0.35 && (los || self.peeking) {
                                         fire[si] = true;
                                         self.laser_hold = true;
                                     }
@@ -1625,11 +1862,28 @@ impl Bot {
             } else if let Some(s) = self.sounds.iter().rev().find(|s| o.t - s.0 < 2.0 && s.3 != "drop" && s.3 != "death") {
                 aim = [s.1, 0.0];
             } else if mode == Mode::Hold || (act.r#move[0] == 0.0 && act.r#move[1] == 0.0) {
-                self.scan_yaw = wrap(self.scan_yaw + 0.25);
-                aim = [self.scan_yaw, 0.0];
+                let at_spot = self
+                    .hold_spot
+                    .and_then(|(c, _)| self.world.map(|w| w.cell_xy(c)))
+                    .map(|(x, y)| ((x as f64 - pos[0]).powi(2) + (y as f64 - pos[1]).powi(2)).sqrt() < 3.0)
+                    .unwrap_or(false);
+                match (self.hold_open, at_spot) {
+                    (Some(open), true) => {
+                        // back to the wall: sweep +-70 deg around the open direction
+                        aim = [wrap(open + (o.t * 1.3).sin() * 1.2), 0.0];
+                        self.scan_yaw = aim[0];
+                    }
+                    _ => {
+                        self.scan_yaw = wrap(self.scan_yaw + 0.25);
+                        aim = [self.scan_yaw, 0.0];
+                    }
+                }
             } else {
                 let m = act.r#move;
-                aim = [m[1].atan2(m[0]), 0.0];
+                let heading = m[1].atan2(m[0]);
+                // sweep +-60 deg around the heading: the 120 deg FOV then covers ~240 deg
+                let sweep = (o.t * 1.6).sin() * 1.05;
+                aim = [wrap(heading + sweep), 0.0];
                 self.scan_yaw = aim[0];
             }
             // shoot crates when calm (cubes + weapons)
