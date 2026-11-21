@@ -90,6 +90,19 @@ pub struct Tune {
     pub gun_lat: f64,
     /// hold gun fire at moving targets beyond this distance (m)
     pub gun_far: f64,
+    /// radians of torso slew credited to the fire check (the shot leaves after >= 1 tick of slewing)
+    pub slew_credit: f64,
+    /// keep this far from known enemies that are not engaging us (0 = off): steer away while
+    /// holding/rotating/looting and avoid hold spots near them
+    pub avoid_r: f64,
+    /// also consider roof spots (reached by jet climbs) as hold spots
+    pub roof_hold: bool,
+    /// cube pickup search radius (m)
+    pub cube_radius: f64,
+    /// after our own kill, collect drops within 20 m of the death spot up to this far away (0 = off)
+    pub kill_loot: f64,
+    /// weapon search radius when slot 1 already holds something (m)
+    pub loot_radius_full: f64,
     /// preferred fighting distance with a gun only / with a laser
     pub pref_gun: f64,
     pub pref_laser: f64,
@@ -135,6 +148,12 @@ impl Default for Tune {
             laser_tol_m: 1.6,
             gun_lat: 0.05,
             gun_far: 140.0,
+            slew_credit: 0.0,
+            avoid_r: 0.0,
+            roof_hold: false,
+            cube_radius: 60.0,
+            kill_loot: 0.0,
+            loot_radius_full: 70.0,
             pref_gun: 60.0,
             pref_laser: 90.0,
             self_comp: true,
@@ -198,6 +217,12 @@ impl Tune {
                 "gun_lat" => self.gun_lat = v,
                 "gun_far" => self.gun_far = v,
                 "pref_gun" => self.pref_gun = v,
+                "cube_radius" => self.cube_radius = v,
+                "slew_credit" => self.slew_credit = v,
+                "avoid_r" => self.avoid_r = v,
+                "roof_hold" => self.roof_hold = v != 0.0,
+                "kill_loot" => self.kill_loot = v,
+                "loot_radius_full" => self.loot_radius_full = v,
                 "pref_laser" => self.pref_laser = v,
                 "self_comp" => self.self_comp = v != 0.0,
                 "cover_heal_hp" => self.cover_heal_hp = v,
@@ -307,6 +332,8 @@ pub struct Bot {
     /// peek pair: (hidden spot, exposed spot, target id, target pos when computed, t)
     peek: Option<((f64, f64), (f64, f64), i64, [f64; 3], f64)>,
     pub peeking: bool,
+    /// (position, time) of mechs we killed: their cubes and weapons drop there
+    kill_spots: Vec<([f64; 3], f64)>,
     cover_until: f64,
     cover_spot: Option<(f64, f64)>,
     cover_threats: Vec<[f64; 3]>,
@@ -368,6 +395,7 @@ impl Bot {
             known_pickups: HashMap::new(),
             peek: None,
             peeking: false,
+            kill_spots: Vec::new(),
             cover_until: -1.0,
             cover_spot: None,
             cover_threats: Vec::new(),
@@ -476,6 +504,13 @@ impl Bot {
                 "hit" => {
                     self.last_dealt_t = t;
                 }
+                "kill" => {
+                    if let Some(tid) = ev.target {
+                        if let Some(tr) = self.tracks.get(&(tid as i64)) {
+                            self.kill_spots.push((tr.pos, t));
+                        }
+                    }
+                }
                 "take_failed" => {
                     if let Some(id) = ev.id.as_ref().and_then(|v| v.as_f64()) {
                         self.blocked_pickups.insert(id as i64, t + 20.0);
@@ -502,6 +537,7 @@ impl Bot {
             }
         }
         self.blocked_pickups.retain(|_, until| *until > t);
+        self.kill_spots.retain(|k| t - k.1 < 45.0);
         // remember weapon pickups; forget ones that should be visible but are not
         for p in &o.pickups {
             self.known_pickups.insert(p.id as i64, (p.kind.clone(), p.pos, t));
@@ -973,6 +1009,46 @@ impl Bot {
             || self.sounds.iter().any(|s| o.t - s.0 < 4.0 && s.2 == "near" && (s.3 == "step" || s.3 == "boost"));
         if enemy_near && !urgent && (mode == Mode::Hold || mode == Mode::Loot) {
             speed = speed.min(0.4);
+        }
+
+        // ---------------- keep away from enemies we are not fighting
+        if self.tune.avoid_r > 0.0 && matches!(mode, Mode::Hold | Mode::Rotate | Mode::Loot) && !(mode == Mode::Rotate && urgent) {
+            let r = self.tune.avoid_r;
+            let mut rep = [0.0f64, 0.0];
+            let mut close = false;
+            for e in self.tracks.values() {
+                if e.is_npc || o.t - e.seen_t > 15.0 || o.t - e.hurt_us_t < 4.0 {
+                    continue;
+                }
+                let d = d2(e.pos, pos);
+                if d < r && d > 0.1 {
+                    let k = (r - d) / r;
+                    rep[0] += (pos[0] - e.pos[0]) / d * k;
+                    rep[1] += (pos[1] - e.pos[1]) / d * k;
+                    close = true;
+                }
+            }
+            if close {
+                let n = (rep[0] * rep[0] + rep[1] * rep[1]).sqrt();
+                if n > 1e-6 {
+                    let away = [rep[0] / n, rep[1] / n];
+                    // blend with the current goal direction, but never step toward the threat
+                    let mn = (mv[0] * mv[0] + mv[1] * mv[1]).sqrt();
+                    let goal = if mn > 1e-6 { [mv[0] / mn, mv[1] / mn] } else { [0.0, 0.0] };
+                    let along = goal[0] * away[0] + goal[1] * away[1];
+                    let g = if along < 0.0 { [goal[0] - along * away[0], goal[1] - along * away[1]] } else { goal };
+                    let w = n.min(1.5);
+                    let dir = [g[0] + away[0] * w * 1.5, g[1] + away[1] * w * 1.5];
+                    // stay inside the zone
+                    if self.point_safe(o, pos[0] + dir[0] * 12.0, pos[1] + dir[1] * 12.0, 6.0, 4.0) {
+                        mv = self.walkable_dir(pos, dir);
+                        speed = speed.max(0.42);
+                        if mode == Mode::Hold {
+                            self.hold_spot = None; // re-pick a spot away from them
+                        }
+                    }
+                }
+            }
         }
 
         // ---------------- duck an enemy laser that is charging at us
@@ -1598,7 +1674,14 @@ impl Bot {
             }
             let d = d2(p.pos, pos);
             let dz = (p.pos[2] - pos[2]).abs();
-            let lr = if slot1_empty { self.tune.loot_radius } else { 70.0 };
+            let near_kill = self.tune.kill_loot > 0.0 && self.kill_spots.iter().any(|k| d2(k.0, p.pos) < 20.0);
+            let lr = if near_kill {
+                self.tune.kill_loot
+            } else if slot1_empty {
+                self.tune.loot_radius
+            } else {
+                self.tune.loot_radius_full
+            };
             if d > lr || dz > 8.0 {
                 continue;
             }
@@ -1618,7 +1701,9 @@ impl Bot {
             }
             let d = d2(c.pos, pos);
             let dz = (c.pos[2] - pos[2]).abs();
-            if d > 60.0 || dz > 6.0 {
+            let near_kill = self.tune.kill_loot > 0.0 && self.kill_spots.iter().any(|k| d2(k.0, c.pos) < 20.0);
+            let cr = if near_kill { self.tune.kill_loot } else { self.tune.cube_radius };
+            if d > cr || dz > 6.0 {
                 continue;
             }
             if !self.point_safe(o, c.pos[0], c.pos[1], 15.0, 8.0) {
@@ -1709,7 +1794,19 @@ impl Bot {
                     _ => 0.0,
                 };
                 let cover = w.cover[u] as f64 / 255.0 * 12.0;
-                let sc = wall + cover - dme * 0.15 - (dc / r.max(1.0)) * 4.0;
+                let mut enemy_pen = 0.0;
+                if self.tune.avoid_r > 0.0 {
+                    for e in self.tracks.values() {
+                        if e.is_npc || o.t - e.seen_t > 20.0 {
+                            continue;
+                        }
+                        let de = ((e.pos[0] - x as f64).powi(2) + (e.pos[1] - y as f64).powi(2)).sqrt();
+                        if de < self.tune.avoid_r * 1.3 {
+                            enemy_pen += 25.0 * (self.tune.avoid_r * 1.3 - de) / (self.tune.avoid_r * 1.3);
+                        }
+                    }
+                }
+                let sc = wall + cover - dme * 0.15 - (dc / r.max(1.0)) * 4.0 - enemy_pen;
                 cands.push((sc, u));
             }
             if seen.len() > 8000 {
@@ -1747,6 +1844,39 @@ impl Bot {
         let mut eval: Vec<(f64, usize)> = cands.iter().take(60).cloned().collect();
         let stride = (cands.len() / 40).max(1);
         eval.extend(cands.iter().step_by(stride).take(40).cloned());
+        if self.tune.roof_hold {
+            // roof cells well away from the edge, 6-40 m above us, inside the target disc
+            let mut roofs: Vec<(u8, usize)> = Vec::new();
+            let ci = (pos[0] as f32 - w.min_x).round() as i32;
+            let cj = (pos[1] as f32 - w.min_y).round() as i32;
+            for dj in (-70i32..=70).step_by(3) {
+                for di in (-70i32..=70).step_by(3) {
+                    let ii = ci + di;
+                    let jj = cj + dj;
+                    if ii < 0 || jj < 0 || ii >= w.nx as i32 || jj >= w.ny as i32 {
+                        continue;
+                    }
+                    let c = jj as usize * w.nx + ii as usize;
+                    if !w.standable(c) || w.flags[c] & crate::world::PRISM_FLOOR == 0 || w.wdist[c] < 5 {
+                        continue;
+                    }
+                    let up = w.floor[c] as f64 - pos[2];
+                    if !(6.0..=40.0).contains(&up) {
+                        continue;
+                    }
+                    let (x, y) = w.cell_xy(c);
+                    let dc = ((x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)).sqrt();
+                    if dc > r * 0.9 {
+                        continue;
+                    }
+                    roofs.push((w.wdist[c], c));
+                }
+            }
+            roofs.sort_by(|a, b| b.0.cmp(&a.0));
+            for &(_, c) in roofs.iter().take(25) {
+                eval.push((6.0, c));
+            }
+        }
         let mut best = eval[0].1;
         let mut bs = f64::MIN;
         for &(sc, c) in &eval {
@@ -1937,7 +2067,7 @@ impl Bot {
                             if desired.is_none() && !laser_phase {
                                 desired = Some(a);
                             }
-                            let err = ang_err(me.aim, a);
+                            let err = (ang_err(me.aim, a) - self.tune.slew_credit).max(0.0);
                             let tol = (self.tune.gun_tol_m / d.max(1.0)).atan() + self.tune.gun_tol_rad;
                             // beyond ~140 m a strafing target is almost never hit (sim: ~10%)
                             let worth = !self.tune.aim_v2 || d < self.tune.gun_far || tspeed < 4.0 || tg.ghost;
@@ -1974,7 +2104,7 @@ impl Bot {
                             if laser_phase || !has_gun || desired.is_none() || (!self.tune.aim_v2 && d > 50.0) {
                                 desired = Some(a2);
                             }
-                            let err = ang_err(me.aim, a2);
+                            let err = (ang_err(me.aim, a2) - self.tune.slew_credit).max(0.0);
                             let tol = if self.tune.aim_v2 { (self.tune.laser_tol_m / d.max(1.0)).atan() + 0.002 } else { (2.0f64 / d.max(1.0)).atan() + 0.008 };
                             if d < range * 0.97 {
                                 if charge <= 0.0 {

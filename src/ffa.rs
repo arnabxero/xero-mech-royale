@@ -77,6 +77,9 @@ pub struct SimMech {
     pub hits: [u32; 3],
     pub laser_shots: u32,
     pub laser_hits: u32,
+    /// recent damage log (t, attacker, weapon, amount) for death diagnostics
+    pub dmg_log: Vec<(f64, usize, String, f64)>,
+    pub death_diag: String,
     /// damage taken from behind (x1.5 already applied) and in total, from mechs
     pub dmg_rear: f64,
     pub dmg_mech: f64,
@@ -325,6 +328,8 @@ impl<'a> Ffa<'a> {
                 hits: [0; 3],
                 laser_shots: 0,
                 laser_hits: 0,
+                dmg_log: Vec::new(),
+                death_diag: String::new(),
                 dmg_rear: 0.0,
                 dmg_mech: 0.0,
                 seen_s: 0.0,
@@ -378,6 +383,13 @@ impl<'a> Ffa<'a> {
                 }
                 f.skill.push((m.id, grade));
                 grade += 1;
+            }
+        }
+        if std::env::var("SIM_OPP_NOCLIMB").is_ok() {
+            for m in f.mechs.iter_mut() {
+                if let Some(b) = m.opp.as_mut() {
+                    b.set_no_climb();
+                }
             }
         }
         if std::env::var("SQUAD_NOLEAD").is_ok() {
@@ -724,7 +736,11 @@ impl<'a> Ffa<'a> {
         let amt = if rear { amount * 1.5 } else { amount };
         let t = self.t;
         {
+            let t_now = self.t;
             let m = &mut self.mechs[target];
+            if m.kind == Kind::Ours {
+                m.dmg_log.push((t_now, by, weapon.to_string(), amt));
+            }
             m.dmg_mech += amt;
             if rear {
                 m.dmg_rear += amt;
@@ -828,6 +844,27 @@ impl<'a> Ffa<'a> {
         let m = &mut self.mechs[i];
         if !m.alive {
             return;
+        }
+        if m.kind == Kind::Ours {
+            let t0 = self.t - 10.0;
+            let recent: Vec<&(f64, usize, String, f64)> = m.dmg_log.iter().filter(|d| d.0 >= t0).collect();
+            let mut att: Vec<usize> = recent.iter().map(|d| d.1).collect();
+            att.sort();
+            att.dedup();
+            let by_w = |w: &str| recent.iter().filter(|d| d.2 == w).map(|d| d.3).sum::<f64>();
+            let tot: f64 = recent.iter().map(|d| d.3).sum();
+            let first_hit = m.dmg_log.first().map(|d| d.0).unwrap_or(self.t);
+            let weapons: Vec<String> = m.weapons.iter().flatten().map(|w| w.kind.clone()).collect();
+            m.death_diag = format!(
+                "DIAG att10={} laser10={:.0} gun10={:.0} other10={:.0} first_hit={:.0} weapons={} zone={}",
+                att.len(),
+                by_w("laser"),
+                by_w("gun"),
+                tot - by_w("laser") - by_w("gun"),
+                first_hit,
+                weapons.join("+"),
+                zone as u8
+            );
         }
         m.alive = false;
         m.mode_at_death = m.bot.as_ref().map(|b| b.label.clone()).or_else(|| m.opp.as_ref().map(|b| b.label.clone())).unwrap_or_default();

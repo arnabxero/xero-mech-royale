@@ -331,6 +331,13 @@ impl Bot {
         }
     }
 
+    /// Simulator option: this opponent cannot climb onto roofs.
+    pub fn set_no_climb(&mut self) {
+        self.ff.no_climb = true;
+        self.ff_next.no_climb = true;
+        self.astar.no_climb = true;
+    }
+
     // ------------------------------------------------------------------ memory
     fn update_memory(&mut self, o: &Obs) {
         self.t = o.t;

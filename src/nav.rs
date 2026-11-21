@@ -59,11 +59,13 @@ pub struct FlowField {
     pub tag: (i64, i64, i64),
     /// effective goal radius of the last start_disc
     pub radius: f32,
+    /// ignore climb edges (simulated opponents that cannot jet onto roofs)
+    pub no_climb: bool,
 }
 
 impl FlowField {
     pub fn new(n: usize) -> Self {
-        FlowField { dist: vec![INF; n], next: vec![NONE; n], heap: BinaryHeap::new(), done: true, pops: 0, tag: (0, 0, -1), radius: 0.0 }
+        FlowField { dist: vec![INF; n], next: vec![NONE; n], heap: BinaryHeap::new(), done: true, pops: 0, tag: (0, 0, -1), radius: 0.0, no_climb: false }
     }
 
     /// Start a new search. `seed(c) -> Option<cost>` gives the start cost of goal cells.
@@ -154,6 +156,9 @@ impl FlowField {
             }
             for &(p, cost) in w.jumps_to(u) {
                 let p = p as usize;
+                if self.no_climb && w.floor[u] - w.floor[p] > w.p.step_up {
+                    continue;
+                }
                 let nd = d + cost;
                 if nd < self.dist[p] {
                     self.dist[p] = nd;
@@ -229,11 +234,12 @@ pub struct AStar {
     stamp: Vec<u32>,
     gen: u32,
     heap: BinaryHeap<Reverse<u64>>,
+    pub no_climb: bool,
 }
 
 impl AStar {
     pub fn new(n: usize) -> Self {
-        AStar { g: vec![INF; n], parent: vec![NONE; n], stamp: vec![0; n], gen: 0, heap: BinaryHeap::new() }
+        AStar { g: vec![INF; n], parent: vec![NONE; n], stamp: vec![0; n], gen: 0, heap: BinaryHeap::new(), no_climb: false }
     }
 
     /// Bounded A* from cell s towards (gx,gy); stops within goal_r of it or after max_nodes
@@ -297,6 +303,9 @@ impl AStar {
             }
             for &(v, cost) in w.jumps_from(u) {
                 let v = v as usize;
+                if self.no_climb && w.floor[v] - w.floor[u] > w.p.step_up {
+                    continue;
+                }
                 let nd = gu + cost;
                 if self.stamp[v] != gen || nd < self.g[v] {
                     self.stamp[v] = gen;

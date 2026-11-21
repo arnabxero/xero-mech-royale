@@ -238,7 +238,7 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
     let cfg = default_config();
     let w: &'static World = Box::leak(Box::new(load(&cfg)));
     // all simulated bots share finished flow fields (identical zone discs give identical fields)
-    xero_mech::nav::shared::enable(std::env::var("SIM_NO_SHARE").is_err());
+    xero_mech::nav::shared::enable(std::env::var("SIM_NO_SHARE").is_err() && std::env::var("SIM_OPP_NOCLIMB").is_err());
     let mut total = 0.0;
     let mut n_ours: f64 = 0.0;
     let mut zone_deaths = 0;
@@ -323,6 +323,7 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
                         olz[1] += e.laser_hits;
                     }
                 }
+                line += &format!(" {} |", m.death_diag);
                 line += &format!(
                     " ours#{i} seen {:.0}/{:.0}s modes {} |",
                     m.seen_s,
