@@ -687,7 +687,8 @@ impl Bot {
         self.stats_n += 1;
         self.deadline = deadline;
         self.update_memory(o);
-        if !self.ffa_detected && self.tune.ffa_avoid_r > 0.0 && o.alive > 0.0 {
+        // only early deaths count: late zone/drone deaths can also happen in practice
+        if !self.ffa_detected && self.tune.ffa_avoid_r > 0.0 && o.alive > 0.0 && o.t < 240.0 {
             let total = self.cfg.f("match", "mechs", 16.0);
             let others_dead = (total - o.alive) - self.our_kills as f64;
             if others_dead >= self.tune.ffa_deaths {
