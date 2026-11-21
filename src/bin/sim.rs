@@ -259,6 +259,7 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
                     "camper" => Kind::Camper,
                     "aggro" => Kind::Aggro,
                     "squad" | "duel" => Kind::Squad,
+                    "squad2" => Kind::Squad2,
                     "duelg" => Kind::Aggro,
                     "hard" => if i % 2 == 0 { Kind::Aggro } else { Kind::Rusher },
                     _ => match i % 3 {

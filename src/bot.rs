@@ -63,6 +63,12 @@ pub struct Tune {
     pub solo_duel: bool,
     /// peek-fight laser carriers: hide while their laser charges, shoot during its cooldown
     pub peek: bool,
+    /// in a solo situation, attack a lone visible enemy first when our HP fraction is above this
+    pub solo_first_hp: f64,
+    /// farm NPC drones for cubes when calm, until this match time
+    pub npc_farm_until: f64,
+    /// simulator only: aiming error (radians, persistent for 0.5 s) to model weaker opponents
+    pub aim_noise: f64,
     /// sidestep incoming bullets and mortar impacts
     pub dodge: bool,
 }
@@ -85,8 +91,11 @@ impl Default for Tune {
             boost_strafe: false,
             loot_radius: 70.0,
             cover_hold_s: 8.0,
-            solo_duel: false,
+            solo_duel: true,
             peek: true,
+            solo_first_hp: 0.7,
+            npc_farm_until: 300.0,
+            aim_noise: 0.0,
             dodge: true,
         }
     }
@@ -132,6 +141,9 @@ impl Tune {
                 "cover_hold_s" => self.cover_hold_s = v,
                 "solo_duel" => self.solo_duel = v != 0.0,
                 "peek" => self.peek = v != 0.0,
+                "solo_first_hp" => self.solo_first_hp = v,
+                "npc_farm_until" => self.npc_farm_until = v,
+                "aim_noise" => self.aim_noise = v,
                 "dodge" => self.dodge = v != 0.0,
                 _ => eprintln!("unknown tune key {k}"),
             }
@@ -248,6 +260,8 @@ pub struct Bot {
     pub stats_n: u64,
     last_move: [f64; 2],
     deadline: Instant,
+    noise_off: [f64; 2],
+    noise_t: f64,
 }
 
 impl Bot {
@@ -307,6 +321,8 @@ impl Bot {
             stats_n: 0,
             last_move: [0.0, 0.0],
             deadline: Instant::now(),
+            noise_off: [0.0, 0.0],
+            noise_t: -1.0,
         }
     }
 
@@ -574,6 +590,25 @@ impl Bot {
             }
         }
         let attacker_bearing = self.dmg_log.iter().rev().find(|d| o.t - d.0 < 1.5 && d.1.is_some()).and_then(|d| d.1);
+        // NPC drones: kill the ones shooting us; farm them for cubes when nothing else is around
+        let mut npc_target: Option<Track> = None;
+        if target.is_none() {
+            let mech_recent = self.tracks.values().any(|t| !t.is_npc && o.t - t.seen_t < 6.0);
+            let mut bs = f64::MAX;
+            for t in self.tracks.values() {
+                if !t.is_npc || o.t - t.seen_t > 0.15 {
+                    continue;
+                }
+                let d = d2(t.pos, pos);
+                let attacking = o.t - t.hurt_us_t < 4.0;
+                let farm = !mech_recent && o.t < self.tune.npc_farm_until && hp_frac > 0.6 && d < 70.0
+                    && self.point_safe(o, t.pos[0], t.pos[1], 10.0, 8.0);
+                if (attacking || farm) && d < bs {
+                    bs = d;
+                    npc_target = Some(t.clone());
+                }
+            }
+        }
 
         // ---------------- decide mode
         let mut mode = Mode::Rotate;
@@ -581,6 +616,10 @@ impl Bot {
         let mut speed: f64 = 1.0;
         let mut want_take: Option<u64> = None;
         let mut want_drop: Option<u32> = None;
+        let npc_fight = target.is_none() && npc_target.is_some();
+        if npc_fight {
+            target = npc_target.clone();
+        }
         let mut fight = false;
         let mut cover_from: Vec<[f64; 3]> = Vec::new();
         if let Some(tg) = &target {
@@ -614,12 +653,14 @@ impl Bot {
             let healthy = hp_frac > tn.retreat_hp;
             let tn = &tn;
             let our_laser = me.weapons.iter().flatten().any(|w| w.kind == "laser");
-            if d < tn.fight_close
+            if npc_fight
+                || d < tn.fight_close
                 || (attacking_us && healthy && d < tn.fight_back_range)
                 || (attacking_us && our_laser && healthy && d < 250.0 && me.hp >= tg.hp * 0.9)
                 || (weak && healthy && d < tn.hunt_weak_range)
                 || (tn.aggressive && d < 200.0)
                 || tn.hunt
+                || (solo && !tg.is_npc && hp_frac > tn.solo_first_hp && d < 220.0)
             {
                 fight = true;
             } else if attacking_us && tn.cover_from_far {
@@ -1743,9 +1784,21 @@ impl Bot {
         let has_los = |a: [f64; 3], b: [f64; 3]| -> bool { w.map(|w| w.los(f3(a), f3(b))).unwrap_or(true) };
 
         let mut engaged = false;
+        if self.tune.aim_noise > 0.0 && o.t > self.noise_t {
+            let g = |r: &mut Rng| (r.f() + r.f() + r.f() + r.f() - 2.0) * 1.73;
+            self.noise_off = [g(&mut self.rng) * self.tune.aim_noise, g(&mut self.rng) * self.tune.aim_noise];
+            self.noise_t = o.t + 0.5;
+        }
         if let Some(tg) = target {
             let d = d2(tg.pos, pos);
-            let center = [tg.pos[0], tg.pos[1], tg.pos[2] + 4.5];
+            let mut center = [tg.pos[0], tg.pos[1], tg.pos[2] + 4.5];
+            if self.tune.aim_noise > 0.0 {
+                // aim at a wrong point: sideways and vertical offsets proportional to distance
+                let ux = (tg.pos[0] - pos[0]) / d.max(0.1);
+                let uy = (tg.pos[1] - pos[1]) / d.max(0.1);
+                center = [center[0] - uy * d * self.noise_off[0], center[1] + ux * d * self.noise_off[0], center[2] + d * self.noise_off[1]];
+            }
+            let center = center;
             let los = has_los(muzzle, center) || has_los(muzzle, [tg.pos[0], tg.pos[1], tg.pos[2] + 7.5]);
             let shoot_ok = mode == Mode::Fight || mode == Mode::Retreat || mode == Mode::Cover || (o.t - tg.hurt_us_t < 4.0) || d < 50.0 || self.tune.aggressive;
             if shoot_ok {

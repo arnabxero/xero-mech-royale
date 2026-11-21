@@ -14,6 +14,7 @@ pub enum Kind {
     Ours,
     Aggro,
     Squad,
+    Squad2,
     Example,
     Rusher,
     Camper,
@@ -64,6 +65,7 @@ pub struct SimMech {
     pub laser_charging: bool,
     pub killer: Option<usize>,
     pub mode_at_death: String,
+    pub cubes: f64,
     /// seconds during which at least one living enemy could see this mech
     pub seen_s: f64,
     /// seconds alive
@@ -74,10 +76,29 @@ pub struct SimMech {
 
 struct Bullet {
     owner: usize,
+    /// fired by NPC drone `owner` (index into npcs) instead of a mech
+    npc: bool,
     pos: [f64; 3],
     vel: [f64; 3],
     dist_left: f64,
     dmg: f64,
+}
+
+pub struct Npc {
+    pub home: [f64; 3],
+    pub pos: [f64; 3],
+    pub vel: [f64; 3],
+    pub hp: f64,
+    pub alive: bool,
+    pub target: Option<usize>,
+    pub cooldown: f64,
+    pub wander: [f64; 2],
+    pub wander_t: f64,
+}
+
+struct Cube {
+    id: u64,
+    pos: [f64; 3],
 }
 
 struct Pickup {
@@ -94,6 +115,9 @@ pub struct Ffa<'a> {
     pub mechs: Vec<SimMech>,
     bullets: Vec<Bullet>,
     pickups: Vec<Pickup>,
+    pub npcs: Vec<Npc>,
+    cubes: Vec<Cube>,
+    next_id: u64,
     pub t: f64,
     pub tick: u64,
     pub rng: Rng,
@@ -103,6 +127,8 @@ pub struct Ffa<'a> {
     /// squad members currently hunting (they always know where our mechs are)
     pub hunters: Vec<usize>,
     pub all_hunt_t: f64,
+    /// squad2 skill grades (mech id, grade); weakest hunts first
+    pub skill: Vec<(usize, usize)>,
 }
 
 fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -180,6 +206,17 @@ impl<'a> Ffa<'a> {
                     b.tune = crate::bot::Tune::aggressive();
                     Some(b)
                 }
+                Kind::Squad2 => {
+                    let mut b = Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
+                    b.tune.fight_close = 45.0;
+                    b.tune.fight_back_range = 230.0;
+                    b.tune.cover_from_far = false;
+                    b.tune.retreat_hp = 0.0;
+                    b.tune.dodge = false;
+                    b.tune.solo_duel = false;
+                    b.tune.npc_farm_until = 0.0;
+                    Some(b)
+                }
                 Kind::Squad => {
                     // non-hunting squad members hold the zone and only engage us up close
                     let mut b = Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
@@ -209,6 +246,8 @@ impl<'a> Ffa<'a> {
                     Some(SimWeapon::gun()),
                     if *k == Kind::Squad {
                         Some(SimWeapon::of("laser"))
+                    } else if *k == Kind::Squad2 {
+                        None // assigned with skill below
                     } else if *k == Kind::Ours {
                         std::env::var("SIM_OURS_WEAPON").ok().map(|w| SimWeapon::of(&w))
                     } else {
@@ -230,6 +269,7 @@ impl<'a> Ffa<'a> {
                 laser_charging: false,
                 killer: None,
                 mode_at_death: String::new(),
+                cubes: 0.0,
                 seen_s: 0.0,
                 alive_s: 0.0,
                 modes: HashMap::new(),
@@ -251,8 +291,37 @@ impl<'a> Ffa<'a> {
                 }
             }
         }
+        let mut npcs = Vec::new();
+        let mut tries = 0;
+        while npcs.len() < 12 && tries < 100_000 {
+            tries += 1;
+            let x = w.bounds[0] as f64 + 40.0 + rng.f() * (w.bounds[1] - w.bounds[0] - 80.0) as f64;
+            let y = w.bounds[2] as f64 + 40.0 + rng.f() * (w.bounds[3] - w.bounds[2] - 80.0) as f64;
+            if let Some(c) = w.cell_of(x as f32, y as f32) {
+                if w.standable(c) && w.flags[c] & crate::world::PRISM_FLOOR == 0 {
+                    let p = [x, y, w.floor[c] as f64];
+                    npcs.push(Npc { home: p, pos: p, vel: [0.0; 3], hp: 350.0, alive: true, target: None, cooldown: 0.0, wander: [x, y], wander_t: 0.0 });
+                }
+            }
+        }
         let n = mechs.len();
-        let mut f = Ffa { w, cfg, ph, zs, mechs, bullets: vec![], pickups, t: 0.0, tick: 0, rng, alive: n, budget_ms: 18, log: std::env::var("FFA_TRACE").is_ok(), hunters: vec![], all_hunt_t: 300.0 };
+        let mut f = Ffa { w, cfg, ph, zs, mechs, bullets: vec![], pickups, t: 0.0, tick: 0, rng, alive: n, budget_ms: 18, log: std::env::var("FFA_TRACE").is_ok(), hunters: vec![], all_hunt_t: 300.0, npcs, cubes: vec![], next_id: 5000, skill: vec![] };
+        // squad2: skill grades; aim noise shrinks and lasers appear as skill grows
+        let base_noise: f64 = std::env::var("SQUAD_NOISE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02);
+        let laser_from: usize = std::env::var("SQUAD_LASER_FROM").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let mut grade = 0usize;
+        for m in f.mechs.iter_mut() {
+            if m.kind == Kind::Squad2 {
+                if let Some(b) = m.bot.as_mut() {
+                    b.tune.aim_noise = base_noise * (1.0 - grade as f64 / 16.0);
+                }
+                if grade >= laser_from {
+                    m.weapons[1] = Some(SimWeapon::of("laser"));
+                }
+                f.skill.push((m.id, grade));
+                grade += 1;
+            }
+        }
         f.add_hunter();
         if f.mechs.len() == 2 {
             for m in f.mechs.iter_mut() {
@@ -275,7 +344,19 @@ impl<'a> Ffa<'a> {
         };
         let mut best = None;
         let mut bd = f64::MAX;
+        for &(j, grade) in &self.skill {
+            if !self.mechs[j].alive || self.hunters.contains(&j) {
+                continue;
+            }
+            if (grade as f64) < bd {
+                bd = grade as f64;
+                best = Some(j);
+            }
+        }
         for j in 0..self.mechs.len() {
+            if !self.skill.is_empty() {
+                break;
+            }
             if self.mechs[j].kind != Kind::Squad || !self.mechs[j].alive || self.hunters.contains(&j) {
                 continue;
             }
@@ -288,9 +369,13 @@ impl<'a> Ffa<'a> {
         if let Some(j) = best {
             self.hunters.push(j);
             if let Some(b) = self.mechs[j].bot.as_mut() {
+                let noise = b.tune.aim_noise;
                 b.tune = crate::bot::Tune::aggressive();
                 b.tune.hunt = true;
                 b.tune.dodge = false;
+                b.tune.solo_duel = false;
+                b.tune.npc_farm_until = 0.0;
+                b.tune.aim_noise = noise;
             }
         }
     }
@@ -346,8 +431,8 @@ impl<'a> Ffa<'a> {
             if j == i || !self.mechs[j].alive {
                 continue;
             }
-            let squad_i = self.mechs[i].kind == Kind::Squad;
-            if squad_i && self.mechs[j].kind == Kind::Squad {
+            let squad_i = matches!(self.mechs[i].kind, Kind::Squad | Kind::Squad2);
+            if squad_i && matches!(self.mechs[j].kind, Kind::Squad | Kind::Squad2) {
                 continue; // teammates
             }
             let hunting = squad_i && (self.hunters.contains(&i) || t >= self.all_hunt_t);
@@ -365,14 +450,66 @@ impl<'a> Ffa<'a> {
                         aim: m.aim,
                         hp: Some(m.hp),
                         max_hp: Some(m.max_hp),
-                        cubes: Some(0.0),
+                        cubes: Some(m.cubes),
                         weapons: m.weapons.iter().flatten().map(|w| w.kind.clone()).collect(),
                         charging: m.laser_charging,
                     });
                 }
             }
         }
+        // NPC drones in view (same rules as mechs, no memory)
+        {
+            let a = &self.mechs[i];
+            let e = [a.body.pos[0] as f32, a.body.pos[1] as f32, (a.body.pos[2] + 8.0) as f32];
+            for (k, d) in self.npcs.iter().enumerate() {
+                if !d.alive {
+                    continue;
+                }
+                let dd = dist2(d.pos, a.body.pos);
+                if dd > 200.0 {
+                    continue;
+                }
+                if dd > 45.0 {
+                    let yaw = (d.pos[1] - a.body.pos[1]).atan2(d.pos[0] - a.body.pos[0]);
+                    if wrap(yaw - a.aim[0]).abs() > 60f64.to_radians() {
+                        continue;
+                    }
+                }
+                if !self.w.mech_visible(e, [d.pos[0] as f32, d.pos[1] as f32, d.pos[2] as f32], 3.5, 45.0) {
+                    continue;
+                }
+                mechs.push(ActorObs {
+                    id: (100 + k) as f64,
+                    kind: "npc".into(),
+                    pos: d.pos,
+                    vel: d.vel,
+                    aim: [0.0, 0.0],
+                    hp: Some(d.hp),
+                    max_hp: Some(350.0),
+                    ..Default::default()
+                });
+            }
+        }
         let me = &self.mechs[i];
+        let eye_c = [me.body.pos[0] as f32, me.body.pos[1] as f32, (me.body.pos[2] + 8.0) as f32];
+        let cubes_vis: Vec<ItemObs> = self
+            .cubes
+            .iter()
+            .filter(|c| {
+                let d = dist2(c.pos, me.body.pos);
+                if d > 200.0 {
+                    return false;
+                }
+                if d > 45.0 {
+                    let yaw = (c.pos[1] - me.body.pos[1]).atan2(c.pos[0] - me.body.pos[0]);
+                    if wrap(yaw - me.aim[0]).abs() > 60f64.to_radians() {
+                        return false;
+                    }
+                }
+                self.w.los(eye_c, [c.pos[0] as f32, c.pos[1] as f32, c.pos[2] as f32 + 0.5])
+            })
+            .map(|c| ItemObs { id: c.id as f64, pos: c.pos, hp: None })
+            .collect();
         let mut projectiles = Vec::new();
         for (k, b) in self.bullets.iter().enumerate() {
             if b.owner == i {
@@ -421,7 +558,7 @@ impl<'a> Ffa<'a> {
                 energy: me.body.energy,
                 max_energy: 100.0,
                 grounded: me.body.grounded,
-                cubes: 0.0,
+                cubes: me.cubes,
                 upgrades: vec![],
                 weapons: me.weapons.iter().map(|w| w.as_ref().map(|w| weapon_obs(w, &self.cfg))).collect(),
                 in_zone,
@@ -430,6 +567,7 @@ impl<'a> Ffa<'a> {
             mechs,
             projectiles,
             pickups,
+            cubes: cubes_vis,
             sounds: std::mem::take(&mut me.sounds),
             events: std::mem::take(&mut me.events),
             beams: std::mem::take(&mut me.beams),
@@ -497,9 +635,10 @@ impl<'a> Ffa<'a> {
         if !self.mechs[target].alive {
             return;
         }
-        if self.mechs[target].kind == Kind::Squad && self.mechs[by].kind == Kind::Squad {
+        if matches!(self.mechs[target].kind, Kind::Squad | Kind::Squad2) && matches!(self.mechs[by].kind, Kind::Squad | Kind::Squad2) {
             return;
         }
+        let amount = amount * (1.0 + 0.04 * self.mechs[by].cubes.min(10.0));
         // from_dir: direction the shot travels (xy); attack comes from -from_dir
         let came_from = (-from_dir[1]).atan2(-from_dir[0]);
         let rear = wrap(came_from - self.mechs[target].aim[0]).abs() > std::f64::consts::FRAC_PI_2;
@@ -527,20 +666,78 @@ impl<'a> Ffa<'a> {
             a.events.push(Event { kind: "hit".into(), target: Some(target as f64), amount: Some(amt), weapon: Some(weapon.into()), ..Default::default() });
         }
         if self.mechs[target].hp <= 0.0 {
-            if self.mechs[by].kind == Kind::Ours && self.mechs[target].kind == Kind::Squad {
+            if self.mechs[by].kind == Kind::Ours && matches!(self.mechs[target].kind, Kind::Squad | Kind::Squad2) {
                 self.add_hunter();
             }
             self.mechs[target].killer = Some(by);
             self.kill(target, false);
             self.mechs[by].kills += 1;
             self.mechs[by].events.push(Event { kind: "kill".into(), target: Some(target as f64), ..Default::default() });
-            // death drop: non-gun weapons
+            // death drop: cubes + 2, non-gun weapons
             let p = self.mechs[target].body.pos;
+            let nc = self.mechs[target].cubes as usize + 2;
+            self.drop_cubes(p, nc);
             let ws: Vec<String> = self.mechs[target].weapons.iter().flatten().filter(|w| w.kind != "gun").map(|w| w.kind.clone()).collect();
             for k in ws {
                 let id = 9000 + self.rng.next_u64() % 100000;
                 self.pickups.push(Pickup { id, kind: k, pos: p });
             }
+        }
+    }
+
+    fn drop_cubes(&mut self, p: [f64; 3], n: usize) {
+        for k in 0..n {
+            let a = k as f64 * 2.4;
+            let id = self.next_id;
+            self.next_id += 1;
+            self.cubes.push(Cube { id, pos: [p[0] + a.cos() * 1.5, p[1] + a.sin() * 1.5, p[2]] });
+        }
+    }
+
+    /// NPC bullet hits mech j.
+    fn npc_hits(&mut self, j: usize, npc: usize, amount: f64, v: [f64; 2]) {
+        if !self.mechs[j].alive {
+            return;
+        }
+        let came_from = (-v[1]).atan2(-v[0]);
+        let rear = wrap(came_from - self.mechs[j].aim[0]).abs() > std::f64::consts::FRAC_PI_2;
+        let amt = if rear { amount * 1.5 } else { amount };
+        let t = self.t;
+        let m = &mut self.mechs[j];
+        m.hp -= amt;
+        m.dmg_taken += amt;
+        m.last_combat_t = t;
+        m.events.push(Event {
+            kind: "damaged".into(),
+            amount: Some(amt),
+            weapon: Some("npc".into()),
+            bearing: Some(came_from),
+            by: Some((100 + npc) as f64),
+            rear: Some(rear),
+            ..Default::default()
+        });
+        if m.hp <= 0.0 {
+            self.kill(j, false);
+            let p = self.mechs[j].body.pos;
+            let nc = self.mechs[j].cubes as usize + 2;
+            self.drop_cubes(p, nc);
+        }
+    }
+
+    fn damage_npc(&mut self, k: usize, by: usize, amount: f64) {
+        if !self.npcs[k].alive {
+            return;
+        }
+        let amount = amount * (1.0 + 0.04 * self.mechs[by].cubes.min(10.0));
+        self.npcs[k].hp -= amount;
+        self.npcs[k].target = Some(by);
+        let t = self.t;
+        self.mechs[by].last_combat_t = t;
+        self.mechs[by].events.push(Event { kind: "hit".into(), target: Some((100 + k) as f64), amount: Some(amount), weapon: Some("gun".into()), ..Default::default() });
+        if self.npcs[k].hp <= 0.0 {
+            self.npcs[k].alive = false;
+            let p = self.npcs[k].pos;
+            self.drop_cubes(p, 2);
         }
     }
 
@@ -565,12 +762,16 @@ impl<'a> Ffa<'a> {
         let n = self.mechs.len();
         if self.t >= self.all_hunt_t && self.tick % 20 == 0 {
             for j in 0..n {
-                if self.mechs[j].kind == Kind::Squad {
+                if self.mechs[j].kind == Kind::Squad || self.mechs[j].kind == Kind::Squad2 {
                     if let Some(b) = self.mechs[j].bot.as_mut() {
                         if !b.tune.hunt {
+                            let noise = b.tune.aim_noise;
                             b.tune = crate::bot::Tune::aggressive();
                             b.tune.hunt = true;
                             b.tune.dodge = false;
+                            b.tune.solo_duel = false;
+                            b.tune.npc_farm_until = 0.0;
+                            b.tune.aim_noise = noise;
                         }
                     }
                 }
@@ -765,7 +966,7 @@ impl<'a> Ffa<'a> {
                     let yaw = m.aim[0] + ny;
                     let pitch = m.aim[1] + np;
                     let v = [pitch.cos() * yaw.cos() * 252.0, pitch.cos() * yaw.sin() * 252.0, pitch.sin() * 252.0];
-                    self.bullets.push(Bullet { owner: i, pos: start, vel: v, dist_left: 230.0, dmg: 45.0 });
+                    self.bullets.push(Bullet { owner: i, npc: false, pos: start, vel: v, dist_left: 230.0, dmg: 45.0 });
                     self.hear(muzzle, "gun", 320.0, i);
                 }
                 if let Some(ch) = fire_laser {
@@ -851,12 +1052,26 @@ impl<'a> Ffa<'a> {
         let mut k = 0;
         while k < self.bullets.len() {
             let b = &self.bullets[k];
-            let step_len = 252.0 * dt;
             let np = [b.pos[0] + b.vel[0] * dt, b.pos[1] + b.vel[1] * dt, b.pos[2] + b.vel[2] * dt];
-            let dir = [b.vel[0] / 252.0, b.vel[1] / 252.0, b.vel[2] / 252.0];
             let mut hit: Option<(usize, f64)> = None;
+            let mut hit_npc: Option<(usize, f64)> = None;
+            let spd = (b.vel[0] * b.vel[0] + b.vel[1] * b.vel[1] + b.vel[2] * b.vel[2]).sqrt().max(1.0);
+            let step_len = spd * dt;
+            let dir = [b.vel[0] / spd, b.vel[1] / spd, b.vel[2] / spd];
+            if !b.npc {
+                for (k, d) in self.npcs.iter().enumerate() {
+                    if !d.alive {
+                        continue;
+                    }
+                    if let Some(tt) = ray_cyl(b.pos, dir, d.pos, 2.0, 3.5, step_len) {
+                        if hit_npc.map(|h| tt < h.1).unwrap_or(true) {
+                            hit_npc = Some((k, tt));
+                        }
+                    }
+                }
+            }
             for j in 0..n {
-                if j == b.owner || !self.mechs[j].alive {
+                if (!b.npc && j == b.owner) || !self.mechs[j].alive {
                     continue;
                 }
                 if let Some(tt) = ray_cyl(b.pos, dir, self.mechs[j].body.pos, 2.8, 9.0, step_len) {
@@ -874,12 +1089,27 @@ impl<'a> Ffa<'a> {
                 self.bullets.swap_remove(k);
                 continue;
             }
+            // the nearer of a mech hit and an NPC hit wins
+            if let Some((kn, tn)) = hit_npc {
+                if hit.map(|h| tn < h.1).unwrap_or(true) {
+                    let owner = b.owner;
+                    let dmg = b.dmg;
+                    self.bullets.swap_remove(k);
+                    self.damage_npc(kn, owner, dmg);
+                    continue;
+                }
+            }
             if let Some((j, _)) = hit {
                 let owner = b.owner;
                 let dmg = b.dmg;
                 let v = [b.vel[0], b.vel[1]];
+                let is_npc = b.npc;
                 self.bullets.swap_remove(k);
-                self.damage(j, owner, dmg, "gun", v);
+                if is_npc {
+                    self.npc_hits(j, owner, dmg, v);
+                } else {
+                    self.damage(j, owner, dmg, "gun", v);
+                }
                 continue;
             }
             let b = &mut self.bullets[k];
@@ -890,6 +1120,116 @@ impl<'a> Ffa<'a> {
                 continue;
             }
             k += 1;
+        }
+        // NPC drones
+        for k in 0..self.npcs.len() {
+            if !self.npcs[k].alive {
+                continue;
+            }
+            let (home, pos) = (self.npcs[k].home, self.npcs[k].pos);
+            let from_home = dist2(pos, home);
+            // acquire: nearest visible mech within 45 m while near home
+            if self.npcs[k].target.is_none() && from_home < 30.0 {
+                let mut best = None;
+                let mut bd = 45.0;
+                for j in 0..n {
+                    if !self.mechs[j].alive {
+                        continue;
+                    }
+                    let d = dist2(self.mechs[j].body.pos, pos);
+                    if d < bd {
+                        let a = [pos[0] as f32, pos[1] as f32, (pos[2] + 3.0) as f32];
+                        let mp = self.mechs[j].body.pos;
+                        if self.w.los(a, [mp[0] as f32, mp[1] as f32, (mp[2] + 4.5) as f32]) {
+                            bd = d;
+                            best = Some(j);
+                        }
+                    }
+                }
+                self.npcs[k].target = best;
+            }
+            // drop target when far or leashed
+            if let Some(j) = self.npcs[k].target {
+                if !self.mechs[j].alive || dist2(self.mechs[j].body.pos, pos) > 90.0 || from_home > 60.0 {
+                    self.npcs[k].target = None;
+                }
+            }
+            let goal = match self.npcs[k].target {
+                Some(j) => {
+                    let tp = self.mechs[j].body.pos;
+                    if dist2(tp, pos) > 25.0 { [tp[0], tp[1]] } else { [pos[0], pos[1]] }
+                }
+                None => {
+                    if self.t > self.npcs[k].wander_t || from_home > 32.0 {
+                        let a = self.rng.f() * std::f64::consts::TAU;
+                        let r = self.rng.f() * 25.0;
+                        self.npcs[k].wander = [home[0] + a.cos() * r, home[1] + a.sin() * r];
+                        self.npcs[k].wander_t = self.t + 4.0 + self.rng.f() * 6.0;
+                    }
+                    self.npcs[k].wander
+                }
+            };
+            let dx = goal[0] - pos[0];
+            let dy = goal[1] - pos[1];
+            let d = dx.hypot(dy);
+            let v = if d > 1.0 { [dx / d * 5.0, dy / d * 5.0, 0.0] } else { [0.0; 3] };
+            let np = [pos[0] + v[0] * dt, pos[1] + v[1] * dt];
+            if let Some(c) = self.w.cell_of(np[0] as f32, np[1] as f32) {
+                if self.w.standable(c) && (self.w.floor[c] as f64 - pos[2]).abs() < 1.5 {
+                    self.npcs[k].pos = [np[0], np[1], self.w.floor[c] as f64];
+                    self.npcs[k].vel = v;
+                } else {
+                    self.npcs[k].vel = [0.0; 3];
+                }
+            }
+            // shoot
+            self.npcs[k].cooldown -= dt;
+            if let Some(j) = self.npcs[k].target {
+                if self.npcs[k].cooldown <= 0.0 {
+                    let tp = self.mechs[j].body.pos;
+                    let src = [self.npcs[k].pos[0], self.npcs[k].pos[1], self.npcs[k].pos[2] + 3.0];
+                    let tgt = [tp[0], tp[1], tp[2] + 4.5];
+                    let a = [src[0] as f32, src[1] as f32, src[2] as f32];
+                    if self.w.los(a, [tgt[0] as f32, tgt[1] as f32, tgt[2] as f32]) {
+                        let dd = [tgt[0] - src[0], tgt[1] - src[1], tgt[2] - src[2]];
+                        let l = (dd[0] * dd[0] + dd[1] * dd[1] + dd[2] * dd[2]).sqrt().max(0.1);
+                        let sp = 2.5f64.to_radians();
+                        let yaw = dd[1].atan2(dd[0]) + (self.rng.f() - 0.5) * 2.0 * sp;
+                        let pitch = (dd[2] / l).asin() + (self.rng.f() - 0.5) * 2.0 * sp;
+                        let v = [pitch.cos() * yaw.cos() * 90.0, pitch.cos() * yaw.sin() * 90.0, pitch.sin() * 90.0];
+                        self.bullets.push(Bullet { owner: k, npc: true, pos: src, vel: v, dist_left: 120.0, dmg: 25.0 });
+                        self.npcs[k].cooldown = 1.0;
+                        self.hear(src, "npc_gun", 200.0, usize::MAX);
+                    }
+                }
+            }
+        }
+        // cube pickup: closest mech within 3.5 m (lower id on ties)
+        let mut ci = 0;
+        while ci < self.cubes.len() {
+            let cp = self.cubes[ci].pos;
+            let mut best: Option<(usize, f64)> = None;
+            for j in 0..n {
+                if !self.mechs[j].alive {
+                    continue;
+                }
+                let mp = self.mechs[j].body.pos;
+                let d = dist2(mp, cp);
+                if d <= 3.5 && (mp[2] - cp[2]).abs() < 4.0 && best.map(|b| d < b.1).unwrap_or(true) {
+                    best = Some((j, d));
+                }
+            }
+            if let Some((j, _)) = best {
+                let m = &mut self.mechs[j];
+                m.cubes += 1.0;
+                let new_max = 1400.0 * (1.0 + 0.04 * m.cubes.min(10.0));
+                m.hp += new_max - m.max_hp;
+                m.max_hp = new_max;
+                m.events.push(Event { kind: "pickup".into(), cubes: Some(m.cubes), ..Default::default() });
+                self.cubes.swap_remove(ci);
+                continue;
+            }
+            ci += 1;
         }
         // zone, regen
         for i in 0..n {

@@ -7,22 +7,37 @@ _Last updated: Sat 2026-11-21 early (v4)_
 | --- | --- | --- | --- |
 | v1 | 232756c | **2.63** (rank 45/51) | first robust version: nav + basic combat |
 | v2 | 686ba81 | **2.67** (rank 48/79) | concealment hold spots, canopy model, engagement policy, loot/stuck fixes |
-| v3 / v3.1 | 4fded0d / afe5742 | pending (A) | laser-first loot, persistent cover + re-chosen hold spot, bullet/mortar dodging |
-| v3.1-duel | 81cb33a (branch variant-duel) | pending (B) | same + `ENV XERO_TUNE=solo_duel=1` |
-| v4 | see `git log` (the "v4:" commit) | not yet submitted | blind return fire (ghost tracks), laser-charge ducking, wall-at-back hold scanning, pickup memory + travel sweep |
+| v3 / v3.1 | 4fded0d / afe5742 | **3.00** (A) | laser-first loot, persistent cover + re-chosen hold spot, bullet/mortar dodging |
+| v3.1-duel | 81cb33a (branch variant-duel) | **3.19** (B) | same + `ENV XERO_TUNE=solo_duel=1` |
+| v4 | 8dfdbd6 | submitted 8:01 PM CST | blind return fire (ghost tracks), laser-charge ducking, wall-at-back hold scanning, pickup memory + travel sweep |
+| v4.1 | see `git log` (the "v4.1:" commit) | not yet submitted | v4 + solo duel ON + proactive solo engagement (HP>70%) + NPC drone farming for cubes |
 
 ## Submittable?
 **Yes.** The `Dockerfile` at the top level builds the Rust bot and passes the sandboxed `check.py`.
 
-## Conformance (check.py), v4
+## Conformance (check.py), v4.1
 | Run | Result | answer time ms (p50 / p90 / p99 / max) |
 | --- | --- | --- |
-| Local (Windows release exe) | PASS 300/300 in time | 0.2 / 0.4 / 14.4 / 14.4 |
-| Docker sandbox (`--network none --cpus 1 --memory 512m --read-only --tmpfs /tmp --user 65534:65534`) | PASS 300/300 in time, 0 late | 1.4 / 1.7 / 16.6 / 17.0 |
+| Local (Windows release exe) | PASS 300/300 in time | 0.2 / 0.5 / 14.3 / 14.4 |
+| Docker sandbox (`--network none --cpus 1 --memory 512m --read-only --tmpfs /tmp --user 65534:65534`) | PASS 300/300 in time, 0 late | 1.0 / 1.5 / 15.7 / 16.6 |
 
 - `ready` arrives in ~0.4 s in Docker. The world build takes ~170 ms.
 - The p99 comes from the time-sliced Dijkstra flow field, which runs last in each decision and
   stops at 14 ms after the observation arrived. Normal decisions take ~0.1-1 ms.
+
+## Changes in v4.1 (vs v4)
+**Practice score is now the gate (top 32 of 93 qualify).** Practice ≈ number of hunters that die
+before us, so this version is tuned for duels.
+- **Solo duel ON by default.** When at most one enemy is known around us (seen within 4 s, or hit us
+  within 6 s), fight it head-on: no cover runs, retreat only below 25% HP. Real A/B: 3.19 vs 3.00.
+- **Proactive solo engagement.** With HP above 70%, attack a lone visible enemy within 220 m first
+  instead of waiting for its first shot.
+- **NPC drones.** Kill drones that shoot us. When calm (no mech seen for 6 s, HP > 60%, t < 300 s),
+  farm drones within 70 m: each gives 2 cubes, i.e. +8% max HP and damage. This used to be ignored completely.
+- FFA sim (now with 12 NPC drones and cubes): neutral for FFA (aggro 9.42 vs 9.39, mixed 10.99 vs
+  11.08 over 240/200 matches) and more wins vs mixed (83 vs 73).
+- Sim: NPC drones (leash/chase/shoot), cubes (+4% HP/damage, pickup radius, death drops),
+  `squad2` practice-like squad (graded aim noise, weakest hunts first, lasers from grade 4).
 
 ## Changes in v4 (vs v3.1)
 - **Blind return fire / ghost tracks.** Duel traces showed the hunter killing us through tree
