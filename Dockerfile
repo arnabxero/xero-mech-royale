@@ -12,4 +12,6 @@ WORKDIR /bot
 COPY --from=build /src/target/release/xero-mech /bot/xero-mech
 # fallback copy of the map (the match mounts the same files at /arena)
 COPY arena /bot/arena
+# variant v5.2-slowstrafe (behaviour switches only; same binary as the base)
+ENV XERO_TUNE=strafe_min=2.0,strafe_max=4.0
 ENTRYPOINT ["/bot/xero-mech"]
