@@ -57,6 +57,8 @@ pub struct Tune {
     pub loot_radius: f64,
     /// seconds to stay in cover after the last hit from a far attacker
     pub cover_hold_s: f64,
+    /// when only one enemy is around, duel it head-on (no cover runs, later retreat)
+    pub solo_duel: bool,
     /// sidestep incoming bullets and mortar impacts
     pub dodge: bool,
 }
@@ -79,6 +81,7 @@ impl Default for Tune {
             boost_strafe: false,
             loot_radius: 70.0,
             cover_hold_s: 8.0,
+            solo_duel: false,
             dodge: true,
         }
     }
@@ -122,6 +125,7 @@ impl Tune {
                 "boost_strafe" => self.boost_strafe = v != 0.0,
                 "loot_radius" => self.loot_radius = v,
                 "cover_hold_s" => self.cover_hold_s = v,
+                "solo_duel" => self.solo_duel = v != 0.0,
                 "dodge" => self.dodge = v != 0.0,
                 _ => eprintln!("unknown tune key {k}"),
             }
@@ -496,8 +500,32 @@ impl Bot {
             let d = d2(tg.pos, pos);
             let attacking_us = o.t - tg.hurt_us_t < 4.0;
             let weak = tg.hp < tg.max_hp * 0.35;
-            let healthy = hp_frac > self.tune.retreat_hp;
-            let tn = &self.tune;
+            // how many distinct enemies are around (seen recently within 250 m, or hit us lately)?
+            let mut threat_ids: Vec<i64> = self
+                .tracks
+                .values()
+                .filter(|t| !t.is_npc && o.t - t.seen_t < 4.0 && d2(t.pos, pos) < 250.0)
+                .map(|t| t.id)
+                .collect();
+            for dl in self.dmg_log.iter() {
+                if o.t - dl.0 < 6.0 {
+                    if let Some(b) = dl.2 {
+                        if !threat_ids.contains(&b) {
+                            threat_ids.push(b);
+                        }
+                    }
+                }
+            }
+            let solo = self.tune.solo_duel && threat_ids.len() <= 1 && !self.tune.aggressive;
+            let mut tn = self.tune.clone();
+            if solo {
+                tn.cover_from_far = false;
+                tn.fight_back_range = tn.fight_back_range.max(250.0);
+                tn.retreat_hp = tn.retreat_hp.min(0.25);
+                tn.hunt_weak_range = tn.hunt_weak_range.max(230.0);
+            }
+            let healthy = hp_frac > tn.retreat_hp;
+            let tn = &tn;
             let our_laser = me.weapons.iter().flatten().any(|w| w.kind == "laser");
             if d < tn.fight_close
                 || (attacking_us && healthy && d < tn.fight_back_range)

@@ -84,7 +84,13 @@ fn main() {
                         Bot::new(cfg.clone(), world, slot, seed)
                     }));
                     match built {
-                        Ok(b) => bot = Some(b),
+                        Ok(mut b) => {
+                            if let Ok(spec) = std::env::var("XERO_TUNE") {
+                                b.tune.apply(&spec);
+                                eprintln!("[xero] tune overrides: {spec}");
+                            }
+                            bot = Some(b)
+                        }
                         Err(_) => {
                             eprintln!("[xero] bot construction panicked; running without world");
                             bot = Some(Bot::new(cfg, None, slot, seed));
