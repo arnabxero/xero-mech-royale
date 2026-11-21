@@ -1,6 +1,6 @@
 # STATUS: xero-mech (Mech Royale)
 
-_Last updated: Fri 2026-11-20 late (v5.2)_
+_Last updated: Fri 2026-11-20 night (v5.4)_
 
 ## Versions
 | Version | Commit | Practice (48 vs house squad) | Notes |
@@ -29,9 +29,57 @@ _Last updated: Fri 2026-11-20 late (v5.2)_
 | v5-duel | 2ff5d30 | 3.52 | v5 + solo duel |
 | v5-strafe | eb68039 | 3.06 | v5 + faster strafe reversals |
 | v5.0.1 | 50ea7de | (same behaviour as v5) | optional knobs: tac_reload, cover_heal_hp, shoot_close |
-| v5.1 | 127088b | pending | v5 + trigger timing fix (fire when the cooldown ends inside the decision window) |
-| v5.1-slowstrafe | f32184d | pending | v5.1 + strafe_min=2,strafe_max=4 |
-| v5.2 | see `git log` (the "v5.2:" commit) | pending | **v5.1 + latency-compensated gun lead** |
+| v5 | 5b3579f | 3.75 / 3.90 / 3.67 | (re-runs: practice noise ~0.1-0.15) |
+| v5.1 | 127088b | rejected (archive > 20 MB: build dirs were committed by mistake) | v5 + trigger timing fix |
+| v5.2-clean | c65dc6e | 3.81 | v5.1 + latency-compensated gun lead (build output removed) |
+| v5.2-slowstrafe | 8881ad3 | 3.69 | v5.2 + strafe_min=2,strafe_max=4 |
+| master cleanup | 301c9c6 | - | build output removed from the tree; `/target*/` ignored |
+| v5.3 | 3fdf07e | - | more XERO_TUNE switches (defaults = v5.2) |
+| v53-avoid110 | 6c12301 | pending | v5.3 + avoid_r=110 |
+| v53-gunfar100 / v53-gunfar240 | 1212471 / fd86015 | pending | v5.3 + gun_far=100 / 240 (experiments) |
+| v54-avoidsnd | 783b6dd | pending | e5984a2 + avoid_r=110,avoid_sounds=1 |
+| v54-avoid200 | c5416cb | pending | e5984a2 + avoid_r=200,avoid_sounds=1 |
+| **v5.4** | see `git log` (the "v5.4:" commit) | - | **avoidance as default: avoid_r=200, avoid_sounds on** (same behaviour as v54-avoid200) |
+
+## Enemy avoidance (v53-avoid110, v54-avoidsnd)
+Cause-of-death diagnostics in the practice-like sims:
+- Most deaths are multi-attacker: 82% in squad2 have 2+ distinct attackers in the last 10 s.
+- Lasers do 60-69% of the killing damage.
+- The first hit comes early (median 9-17 s).
+- About 77% of deaths happen while retreating.
+The extra attackers are mostly enemies we walk near. Avoidance: when not fighting, steer away from
+any known non-engaging enemy within `avoid_r` (never toward them, staying in the zone), and
+penalise hold spots near known enemies. `avoid_sounds` also treats footsteps (<= 40 m) and nearby
+gunfire/laser sounds from the last 3 s as threats at their bearing.
+Sim, fresh seeds, vs v5.2 behaviour (512 squad / 256 aggro matches):
+
+| Config | squad2 | squad3 | aggro |
+| --- | --- | --- | --- |
+| v5.2 | 1.18 | 7.27 | 8.80 |
+| avoid_r=110 | 1.43 | 7.60 | 9.11 |
+| avoid_r=110 + avoid_sounds | **1.48** | **7.65** | **9.14** |
+
+On an earlier seed set avoid_r=110 was only +0.09 / +0.14 / -0.09, so the true effect is probably
+about +0.2-0.3.
+
+Radius sweep (avoid_sounds on, 512 squad / 256 FFA matches per cell, two seed sets for 110-200):
+
+| Radius | squad2 | squad3 | aggro | mixed |
+| --- | --- | --- | --- | --- |
+| 0 (v5.2) | ~1.18 | ~7.3 | 9.48 | 11.82 |
+| 110 | 1.42 / 1.48 | 7.91 / 8.03 | | |
+| 150 | 1.65 / 1.62 | 7.97 / 8.10 | | |
+| 200 | 1.76 / 1.73 / 1.81 | 7.99 / 8.05 / 8.11 | **10.14** | **12.01** |
+| 260 | 1.69 | 8.27 | 10.31 | 12.22 |
+| 330 | 1.63 | 8.25 | 10.56 | 11.91 |
+
+200 m was picked as the default (best in squad2, which is structurally closest to practice, and
+strong in the FFA mixes). Conformance (server, sandboxed docker, 1 pinned core): PASS 300/300,
+answer ms p50 0.6 / p90 1.0 / p99 15.0 / max 16.7. Negative or neutral and not shipped:
+- Rooftop holding: worse everywhere, even vs non-climbing opponents.
+- Kill-spot looting, slew-credited fire check, preferred-range changes, tactical reload,
+  heal-in-cover.
+- Solo duel and drone fight-back: clearly negative.
 
 ## Changes in v5.2 (vs v5.1)
 - **Latency-compensated gun lead.** Shots leave 1-2 ticks (0.05-0.1 s) after the observed state.

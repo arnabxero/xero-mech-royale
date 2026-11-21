@@ -99,6 +99,8 @@ pub struct Tune {
     pub roof_hold: bool,
     /// avoidance also steers away from enemies located by sound (steps, gunfire)
     pub avoid_sounds: bool,
+    /// how long (s) an enemy sighting keeps penalising hold spots near it
+    pub avoid_mem: f64,
     /// retreat threshold (HP fraction) while 2+ distinct attackers hit us within 6 s (0 = off)
     pub gang_retreat_hp: f64,
     /// cube pickup search radius (m)
@@ -153,9 +155,10 @@ impl Default for Tune {
             gun_lat: 0.05,
             gun_far: 140.0,
             slew_credit: 0.0,
-            avoid_r: 0.0,
+            avoid_r: 200.0,
             roof_hold: false,
-            avoid_sounds: false,
+            avoid_sounds: true,
+            avoid_mem: 20.0,
             gang_retreat_hp: 0.0,
             cube_radius: 60.0,
             kill_loot: 0.0,
@@ -228,6 +231,7 @@ impl Tune {
                 "avoid_r" => self.avoid_r = v,
                 "roof_hold" => self.roof_hold = v != 0.0,
                 "avoid_sounds" => self.avoid_sounds = v != 0.0,
+                "avoid_mem" => self.avoid_mem = v,
                 "gang_retreat_hp" => self.gang_retreat_hp = v,
                 "kill_loot" => self.kill_loot = v,
                 "loot_radius_full" => self.loot_radius_full = v,
@@ -465,7 +469,8 @@ impl Bot {
         }
         // forget stale tracks
         let t = o.t;
-        self.tracks.retain(|_, v| t - v.seen_t < 20.0);
+        let keep = self.tune.avoid_mem.max(20.0);
+        self.tracks.retain(|_, v| t - v.seen_t < keep);
         for ev in &o.events {
             match ev.kind.as_str() {
                 "damaged" => {
@@ -1829,7 +1834,7 @@ impl Bot {
                 let mut enemy_pen = 0.0;
                 if self.tune.avoid_r > 0.0 {
                     for e in self.tracks.values() {
-                        if e.is_npc || o.t - e.seen_t > 20.0 {
+                        if e.is_npc || o.t - e.seen_t > self.tune.avoid_mem {
                             continue;
                         }
                         let de = ((e.pos[0] - x as f64).powi(2) + (e.pos[1] - y as f64).powi(2)).sqrt();
