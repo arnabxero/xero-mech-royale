@@ -405,7 +405,7 @@ class Brain {
     }
 
     // heal: hold still (silent) out of sight until HP is back
-    const healing = !moveGoal && !target && !zoneGoal && nearCubeD > 40 && (hpFrac < 0.55 || (t < this.hideUntil && hpFrac < 0.9))
+    const healing = !moveGoal && !target && !zoneGoal && nearCubeD > 40 && (hpFrac < 0.7 || (t < this.hideUntil && hpFrac < 0.95))
     let slow = false
     if (healing) {
       mode = "heal"
