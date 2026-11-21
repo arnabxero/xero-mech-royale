@@ -1,6 +1,6 @@
 # STATUS: xero-mech (Mech Royale)
 
-_Last updated: Fri 2026-11-20 late (v5)_
+_Last updated: Fri 2026-11-20 late (v5.1)_
 
 ## Versions
 | Version | Commit | Practice (48 vs house squad) | Notes |
@@ -25,7 +25,31 @@ _Last updated: Fri 2026-11-20 late (v5)_
 - The p99 comes from the time-sliced Dijkstra flow field, which runs last in each decision and
   stops at 14 ms after the observation arrived. Normal decisions take ~0.1-1 ms.
 
-| v5 | see `git log` (the "v5:" commit) | pending | **v4 behaviour + aiming execution fixes** (v4.1 policy changes off by default) |
+| v5 | 5b3579f | **3.75, 3.90** (two runs) | v4 behaviour + aiming execution fixes (v4.1 policy changes off by default) |
+| v5-duel | 2ff5d30 | 3.52 | v5 + solo duel |
+| v5-strafe | eb68039 | 3.06 | v5 + faster strafe reversals |
+| v5.0.1 | 50ea7de | (same behaviour as v5) | optional knobs: tac_reload, cover_heal_hp, shoot_close |
+| v5.1 | see `git log` (the "v5.1:" commit) | pending | **v5 + trigger timing fix** (fire when the cooldown ends inside the decision window) |
+
+## Changes in v5.1 (vs v5)
+- **Trigger timing fix (execution bug).** We used to pull the trigger only when a weapon's cooldown
+  was already 0 at decision time. Decisions come every 0.1 s and the gun's cooldown is 0.24 s, so a
+  shot that would become available mid-window waited for the next decision. The gun effectively
+  fired every ~0.3 s instead of 0.24 s, about 20% less DPS. The server fires as soon as the cooldown
+  ends while the trigger is held. Now we hold the trigger when the cooldown ends within the
+  decision window. The same applies to laser charge start, lightning and mortar.
+- Sim A/B (fire_early off -> on): 1v1 vs gun hunter 46.0% -> **56.3%** wins (1024 matches each,
+  about 7 SE). squad3 7.18 -> 7.35, squad2 1.10 -> 1.17, aggro 9.10 -> 8.88 (under 1 SE).
+- Conformance (server, sandboxed docker, 1 pinned core): PASS 300/300, answer ms p50 0.6 / p90 1.1
+  / p99 15.1 / max 15.6.
+
+Sim lessons since v5 (512 matches per config unless noted):
+- Solo duel: -0.39 squad3, -0.72 aggro (practice agreed: 3.52 vs 3.75).
+- NPC drone fight-back: -0.68 aggro. Never retreating: -1.3 aggro.
+- Not initiating close fights: -0.15 squad2.
+- Tactical reload, heal-in-cover, other retreat thresholds, and strafe frequency (even against
+  non-leading opponents): neutral.
+- Rear damage is 10-14% of damage taken.
 
 ## Changes in v5 (vs v4; the v4.1 policy changes are switched off again)
 Practice ranked v4 (3.35) above v4.1 (2.98), so v5 keeps v4's behaviour: solo duel off, no proactive

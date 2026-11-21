@@ -78,6 +78,9 @@ pub struct Tune {
     pub tac_reload: bool,
     /// open fire on any enemy closer than this even when not fighting it (0 = only when engaged)
     pub shoot_close: f64,
+    /// hold the trigger when a weapon's cooldown ends within this decision's window (the server
+    /// fires as soon as it ends); without it a 0.24 s gun only fires every ~0.3 s
+    pub fire_early: bool,
     /// after breaking LOS, stay in cover until this HP fraction (0 = off), up to 30 s,
     /// unless an enemy comes within 45 m
     pub cover_heal_hp: f64,
@@ -112,6 +115,7 @@ impl Default for Tune {
             aim_v2: true,
             tac_reload: false,
             shoot_close: 50.0,
+            fire_early: true,
             cover_heal_hp: 0.0,
             dodge: true,
         }
@@ -165,6 +169,7 @@ impl Tune {
                 "aim_v2" => self.aim_v2 = v != 0.0,
                 "tac_reload" => self.tac_reload = v != 0.0,
                 "shoot_close" => self.shoot_close = v,
+                "fire_early" => self.fire_early = v != 0.0,
                 "cover_heal_hp" => self.cover_heal_hp = v,
                 "dodge" => self.dodge = v != 0.0,
                 _ => eprintln!("unknown tune key {k}"),
@@ -1832,6 +1837,12 @@ impl Bot {
         let has_los = |a: [f64; 3], b: [f64; 3]| -> bool { w.map(|w| w.los(f3(a), f3(b))).unwrap_or(true) };
 
         let mut engaged = false;
+        // a cooldown that ends before our next decision can still fire if the trigger is held
+        let cd_win = if self.tune.fire_early {
+            (self.cfg.f("match", "decide_every", 2.0) / self.cfg.f("match", "tick_hz", 20.0).max(1.0)) * 0.95
+        } else {
+            0.0
+        };
         if self.tune.aim_noise > 0.0 && o.t > self.noise_t {
             let g = |r: &mut Rng| (r.f() + r.f() + r.f() + r.f() - 2.0) * 1.73;
             self.noise_off = [g(&mut self.rng) * self.tune.aim_noise, g(&mut self.rng) * self.tune.aim_noise];
@@ -1893,7 +1904,7 @@ impl Bot {
                             let tol = (2.0f64 / d.max(1.0)).atan() + 0.01;
                             // beyond ~140 m a strafing target is almost never hit (sim: ~10%)
                             let worth = !self.tune.aim_v2 || d < 140.0 || tspeed < 4.0 || tg.ghost;
-                            if los && worth && d < range * 0.98 && err < tol && wo.cooldown <= 0.0 && wo.ammo.unwrap_or(1.0) > 0.0 {
+                            if los && worth && d < range * 0.98 && err < tol && wo.cooldown <= cd_win && wo.ammo.unwrap_or(1.0) > 0.0 {
                                 fire[si] = true;
                             }
                         }
@@ -1905,7 +1916,7 @@ impl Bot {
                                 desired = Some([yaw, (center[2] - muzzle[2]).atan2(d.max(0.1))]);
                             }
                             let dy = wrap(yaw - me.aim[0]).abs();
-                            if los && d < range - 1.0 && dy < cone * 0.5 * 0.85 && wo.cooldown <= 0.0 && me.energy >= wo.stat("energy", 3.0) {
+                            if los && d < range - 1.0 && dy < cone * 0.5 * 0.85 && wo.cooldown <= cd_win && me.energy >= wo.stat("energy", 3.0) {
                                 fire[si] = true;
                             }
                         }
@@ -1930,7 +1941,7 @@ impl Bot {
                             if d < range * 0.97 {
                                 if charge <= 0.0 {
                                     // start charging only if cooled down and roughly aimed
-                                    if wo.cooldown <= 0.0 && err < 0.35 && (los || self.peeking) {
+                                    if wo.cooldown <= cd_win && err < 0.35 && (los || self.peeking) {
                                         fire[si] = true;
                                         self.laser_hold = true;
                                     }
@@ -1955,7 +1966,7 @@ impl Bot {
                                         desired = Some(a);
                                     }
                                     let err = ang_err(me.aim, a);
-                                    if err < 0.03 && wo.cooldown <= 0.0 {
+                                    if err < 0.03 && wo.cooldown <= cd_win {
                                         fire[si] = true;
                                     }
                                 }
@@ -2028,7 +2039,7 @@ impl Bot {
                     let a = lead_aim(muzzle, c, [0.0, 0.0, 0.0], wo.stat("speed", 252.0));
                     aim = a;
                     let d = d2(c, muzzle);
-                    if ang_err(me.aim, a) < (1.0f64 / d.max(1.0)).atan() + 0.006 && wo.cooldown <= 0.0 && wo.ammo.unwrap_or(1.0) > 0.0 && has_los(muzzle, c) {
+                    if ang_err(me.aim, a) < (1.0f64 / d.max(1.0)).atan() + 0.006 && wo.cooldown <= cd_win && wo.ammo.unwrap_or(1.0) > 0.0 && has_los(muzzle, c) {
                         fire[si] = true;
                     }
                     self.crate_target = Some(cid);
