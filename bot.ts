@@ -352,7 +352,7 @@ class Brain {
       const theirHp = target.hp
       const theirFrac = theirHp / target.maxHp
       const finishing = theirFrac < 0.2 && hpFrac > 0.2 && threats <= 2
-      const losing = !finishing && ((hpFrac < 0.35 && theirFrac > hpFrac + 0.1) || (threats >= 2 && hpFrac < 0.55) || (threats >= 3 && hpFrac < 0.8))
+      const losing = !finishing && ((hpFrac < 0.25 && theirFrac > hpFrac + 0.1) || (threats >= 2 && hpFrac < 0.4) || (threats >= 3 && hpFrac < 0.6))
       if (losing) this.hideUntil = t + 6
       const prefer = lightS >= 0 ? 28 : laserS >= 0 ? 110 : 70
       if (losing && map) {
