@@ -1,25 +1,39 @@
 # STATUS: xero-mech (Mech Royale)
 
-_Last updated: Fri 2026-11-20 night (v2)_
+_Last updated: Fri 2026-11-20 night (v3)_
 
 ## Versions
 | Version | Commit | Practice (48 vs house squad) | Notes |
 | --- | --- | --- | --- |
 | v1 | 232756c | **2.63** (rank 45/51) | first robust version: nav + basic combat |
-| v2 | see `git log` (the "v2:" commit) | pending | concealment hold spots, canopy model, engagement policy, loot/stuck fixes |
+| v2 | 686ba81 | **2.67** (rank 48/79) | concealment hold spots, canopy model, engagement policy, loot/stuck fixes |
+| v3 | see `git log` (the "v3:" commit) | pending | laser-first loot, persistent cover + re-chosen hold spot, bullet/mortar dodging |
 
 ## Submittable?
 **Yes.** The `Dockerfile` at the top level builds the Rust bot and passes the sandboxed `check.py`.
 
-## Conformance (check.py), v2
+## Conformance (check.py), v3
 | Run | Result | answer time ms (p50 / p90 / p99 / max) |
 | --- | --- | --- |
 | Local (Windows release exe) | PASS 300/300 in time | 0.2 / 0.4 / 14.4 / 14.5 |
-| Docker sandbox (`--network none --cpus 1 --memory 512m --read-only --tmpfs /tmp --user 65534:65534`) | PASS 300/300 in time, 0 late | 1.0 / 1.2 / 15.9 / 16.7 |
+| Docker sandbox (`--network none --cpus 1 --memory 512m --read-only --tmpfs /tmp --user 65534:65534`) | PASS 300/300 in time, 0 late | 3.0 / 4.5 / 17.1 / 18.3 |
 
 - `ready` arrives in ~0.4 s in Docker. The world build takes ~170 ms.
 - The p99 comes from the time-sliced Dijkstra flow field, which runs last in each decision and
   stops at 14 ms after the observation arrived. Normal decisions take ~0.1-1 ms.
+
+## Changes in v3 (vs v2)
+- **Loot priority laser > lightning > mortar.** The recorded practice stream shows the house hunter
+  arriving with gun + laser and fighting at 100-150 m. In the sim duel vs such a hunter, our win
+  rate is 8% with gun only, 30% with a laser and 6% with lightning (the hunter never comes within 45 m).
+- **Fight back at range** when we carry a laser too and our HP is at least 90% of theirs.
+- **Persistent cover**: when shot from beyond fight range, pick a spot out of the threat's LOS and
+  stay there for 8 s after the last hit (regen starts after 5 s). Afterwards the hold spot is
+  re-chosen instead of walking back into the exposed one.
+- **Dodging**: predict mortar-shell impacts (ballistic integration to ground/roof) and step out of
+  the splash radius. Sidestep bullets whose closest approach is under 3 m in 0.12-0.8 s.
+- Sim: squad mode (hunters with lasers, teammates don't fight, +1 hunter per kill, all hunt after
+  300 s), 1v1 duel modes (`duel` = laser hunter, `duelg` = gun hunter), lightning "short" effect.
 
 ## Changes in v2 (vs v1)
 - **Canopy model**: exact segment-vs-ellipsoid crown path length from `world.json` trees. A sight
@@ -46,10 +60,12 @@ _Last updated: Fri 2026-11-20 night (v2)_
   - `aggro`: 15 copies of our own bot with an aggressive tune. These navigate well, lead shots,
     and engage anything within 200 m.
 
-| Bench | v1 | v2 |
-| --- | --- | --- |
-| 1 ours vs mixed, 200 matches | 8.85 (60 matches) | **9.67** (44 wins) |
-| 1 ours vs 15 aggro, 100 matches | 7.94 (80 matches) | **8.69** |
+| Bench | v1 | v2 | v3 |
+| --- | --- | --- | --- |
+| 1 ours vs mixed, 200 matches | 8.85 (60 matches) | 9.67 (44 wins) | **10.75** (65 wins) |
+| 1 ours vs 15 aggro, 100 matches | 7.94 (80 matches) | 8.69 | **9.40** |
+| 1v1 vs gun hunter (`duelg`), win % | | | 46% |
+| 1v1 vs laser hunter (`duel`), win %, gun only | | | 8% (30% with a laser) |
 
 (Random placement = 7.5. The SE of the mean is about 0.35 at 200 matches and 0.45 at 100.)
 

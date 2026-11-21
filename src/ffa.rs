@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 pub enum Kind {
     Ours,
     Aggro,
+    Squad,
     Example,
     Rusher,
     Camper,
@@ -98,6 +99,9 @@ pub struct Ffa<'a> {
     pub alive: usize,
     pub budget_ms: u64,
     pub log: bool,
+    /// squad members currently hunting (they always know where our mechs are)
+    pub hunters: Vec<usize>,
+    pub all_hunt_t: f64,
 }
 
 fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -133,6 +137,7 @@ impl<'a> Ffa<'a> {
         let (sc, sr) = zs.circles[0];
         let mut spawns: Vec<[f64; 3]> = Vec::new();
         let mut tries = 0;
+        let duel = kinds.len() == 2;
         while spawns.len() < kinds.len() && tries < 200_000 {
             tries += 1;
             let a = rng.f() * std::f64::consts::TAU;
@@ -153,6 +158,10 @@ impl<'a> Ffa<'a> {
             if spawns.iter().any(|s| dist2(*s, [x, y, 0.0]) < sep) {
                 continue;
             }
+            // duels start at a typical engagement distance (130-200 m)
+            if duel && spawns.len() == 1 && dist2(spawns[0], [x, y, 0.0]) > 200.0 {
+                continue;
+            }
             spawns.push([x, y, w.floor[c] as f64]);
         }
         let mut mechs = Vec::new();
@@ -170,6 +179,16 @@ impl<'a> Ffa<'a> {
                     b.tune = crate::bot::Tune::aggressive();
                     Some(b)
                 }
+                Kind::Squad => {
+                    // non-hunting squad members hold the zone and only engage us up close
+                    let mut b = Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
+                    b.tune.fight_close = 100.0;
+                    b.tune.fight_back_range = 230.0;
+                    b.tune.cover_from_far = false;
+                    b.tune.retreat_hp = 0.0;
+                    b.tune.dodge = false;
+                    Some(b)
+                }
                 _ => None,
             };
             let aim0 = rng.f() * 6.28 - 3.14;
@@ -184,7 +203,17 @@ impl<'a> Ffa<'a> {
                 place: 0,
                 death_t: 0.0,
                 killed_by_zone: false,
-                weapons: vec![Some(SimWeapon::gun()), None],
+                // the house squad shows up with a laser already (seen in the recorded practice stream)
+                weapons: vec![
+                    Some(SimWeapon::gun()),
+                    if *k == Kind::Squad {
+                        Some(SimWeapon::of("laser"))
+                    } else if *k == Kind::Ours {
+                        std::env::var("SIM_OURS_WEAPON").ok().map(|w| SimWeapon::of(&w))
+                    } else {
+                        None
+                    },
+                ],
                 last_combat_t: -99.0,
                 seen: HashMap::new(),
                 events: vec![],
@@ -221,7 +250,47 @@ impl<'a> Ffa<'a> {
             }
         }
         let n = mechs.len();
-        Ffa { w, cfg, ph, zs, mechs, bullets: vec![], pickups, t: 0.0, tick: 0, rng, alive: n, budget_ms: 18, log: false }
+        let mut f = Ffa { w, cfg, ph, zs, mechs, bullets: vec![], pickups, t: 0.0, tick: 0, rng, alive: n, budget_ms: 18, log: false, hunters: vec![], all_hunt_t: 300.0 };
+        f.add_hunter();
+        if f.mechs.len() == 2 {
+            for m in f.mechs.iter_mut() {
+                if m.kind == Kind::Aggro {
+                    if let Some(b) = m.bot.as_mut() {
+                        b.tune.hunt = true;
+                    }
+                }
+            }
+        }
+        f
+    }
+
+    /// Promote one more squad member to hunter (the one nearest to our first mech).
+    pub fn add_hunter(&mut self) {
+        let ours: Vec<usize> = (0..self.mechs.len()).filter(|&i| self.mechs[i].kind == Kind::Ours && self.mechs[i].alive).collect();
+        let o = match ours.first() {
+            Some(&o) => o,
+            None => return,
+        };
+        let mut best = None;
+        let mut bd = f64::MAX;
+        for j in 0..self.mechs.len() {
+            if self.mechs[j].kind != Kind::Squad || !self.mechs[j].alive || self.hunters.contains(&j) {
+                continue;
+            }
+            let d = dist2(self.mechs[j].body.pos, self.mechs[o].body.pos);
+            if d < bd {
+                bd = d;
+                best = Some(j);
+            }
+        }
+        if let Some(j) = best {
+            self.hunters.push(j);
+            if let Some(b) = self.mechs[j].bot.as_mut() {
+                b.tune = crate::bot::Tune::aggressive();
+                b.tune.hunt = true;
+                b.tune.dodge = false;
+            }
+        }
     }
 
     fn eye(&self, m: &SimMech) -> [f64; 3] {
@@ -275,7 +344,12 @@ impl<'a> Ffa<'a> {
             if j == i || !self.mechs[j].alive {
                 continue;
             }
-            if self.can_see(i, j) {
+            let squad_i = self.mechs[i].kind == Kind::Squad;
+            if squad_i && self.mechs[j].kind == Kind::Squad {
+                continue; // teammates
+            }
+            let hunting = squad_i && (self.hunters.contains(&i) || t >= self.all_hunt_t);
+            if self.can_see(i, j) || (hunting && self.mechs[j].kind == Kind::Ours) {
                 self.mechs[i].seen.insert(j, t);
             }
             if let Some(&st) = self.mechs[i].seen.get(&j) {
@@ -405,6 +479,9 @@ impl<'a> Ffa<'a> {
         if !self.mechs[target].alive {
             return;
         }
+        if self.mechs[target].kind == Kind::Squad && self.mechs[by].kind == Kind::Squad {
+            return;
+        }
         // from_dir: direction the shot travels (xy); attack comes from -from_dir
         let came_from = (-from_dir[1]).atan2(-from_dir[0]);
         let rear = wrap(came_from - self.mechs[target].aim[0]).abs() > std::f64::consts::FRAC_PI_2;
@@ -432,6 +509,9 @@ impl<'a> Ffa<'a> {
             a.events.push(Event { kind: "hit".into(), target: Some(target as f64), amount: Some(amt), weapon: Some(weapon.into()), ..Default::default() });
         }
         if self.mechs[target].hp <= 0.0 {
+            if self.mechs[by].kind == Kind::Ours && self.mechs[target].kind == Kind::Squad {
+                self.add_hunter();
+            }
             self.mechs[target].killer = Some(by);
             self.kill(target, false);
             self.mechs[by].kills += 1;
@@ -465,6 +545,19 @@ impl<'a> Ffa<'a> {
     pub fn step(&mut self) {
         let dt = 0.05;
         let n = self.mechs.len();
+        if self.t >= self.all_hunt_t && self.tick % 20 == 0 {
+            for j in 0..n {
+                if self.mechs[j].kind == Kind::Squad {
+                    if let Some(b) = self.mechs[j].bot.as_mut() {
+                        if !b.tune.hunt {
+                            b.tune = crate::bot::Tune::aggressive();
+                            b.tune.hunt = true;
+                            b.tune.dodge = false;
+                        }
+                    }
+                }
+            }
+        }
         let decide = self.tick % 2 == 0;
         if decide {
             for i in 0..n {
@@ -683,6 +776,17 @@ impl<'a> Ffa<'a> {
                         let tp = self.mechs[j].body.pos;
                         let dd = [tp[0] - muzzle[0], tp[1] - muzzle[1]];
                         self.damage(j, i, 60.0, "lightning", dd);
+                        let t = self.t;
+                        let m = &mut self.mechs[j];
+                        for wsl in m.weapons.iter_mut().flatten() {
+                            if wsl.kind == "laser" {
+                                wsl.charge = 0.0;
+                                wsl.cooldown = wsl.cooldown.max(2.0);
+                            }
+                        }
+                        m.laser_charging = false;
+                        m.events.push(Event { kind: "effect".into(), effect: Some("short".into()), by: Some(i as f64), ..Default::default() });
+                        let _ = t;
                     }
                 }
             }

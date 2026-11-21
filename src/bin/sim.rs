@@ -248,7 +248,8 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
     for k in 0..runs {
         let seed = seed0 + k;
         let mut kinds = Vec::new();
-        for i in 0..16 {
+        let nmech = if mix.starts_with("duel") { 2 } else { 16 };
+        for i in 0..nmech {
             if i < ours {
                 kinds.push(Kind::Ours);
             } else {
@@ -257,6 +258,8 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
                     "rusher" => Kind::Rusher,
                     "camper" => Kind::Camper,
                     "aggro" => Kind::Aggro,
+                    "squad" | "duel" => Kind::Squad,
+                    "duelg" => Kind::Aggro,
                     "hard" => if i % 2 == 0 { Kind::Aggro } else { Kind::Rusher },
                     _ => match i % 3 {
                         0 => Kind::Example,
@@ -268,7 +271,7 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
             }
         }
         // rotate our slot(s) among spawn positions
-        let rot = (seed as usize) % 16;
+        let rot = (seed as usize) % nmech;
         kinds.rotate_right(rot);
         let mut f = Ffa::new(w, cfg.clone(), seed, &kinds);
         let places = f.run();

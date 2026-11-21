@@ -49,6 +49,16 @@ pub struct Tune {
     pub strafe_max: f64,
     /// zig-zag while retreating/covering
     pub zigzag: bool,
+    /// chase the target at any distance (simulator hunters)
+    pub hunt: bool,
+    /// boost while strafing in fights when energy allows
+    pub boost_strafe: bool,
+    /// weapon loot search radius while slot 1 is empty
+    pub loot_radius: f64,
+    /// seconds to stay in cover after the last hit from a far attacker
+    pub cover_hold_s: f64,
+    /// sidestep incoming bullets and mortar impacts
+    pub dodge: bool,
 }
 
 impl Default for Tune {
@@ -65,6 +75,11 @@ impl Default for Tune {
             strafe_min: 0.8,
             strafe_max: 2.0,
             zigzag: false,
+            hunt: false,
+            boost_strafe: false,
+            loot_radius: 70.0,
+            cover_hold_s: 8.0,
+            dodge: true,
         }
     }
 }
@@ -104,6 +119,10 @@ impl Tune {
                 "strafe_max" => self.strafe_max = v,
                 "zigzag" => self.zigzag = v != 0.0,
                 "aggressive" => self.aggressive = v != 0.0,
+                "boost_strafe" => self.boost_strafe = v != 0.0,
+                "loot_radius" => self.loot_radius = v,
+                "cover_hold_s" => self.cover_hold_s = v,
+                "dodge" => self.dodge = v != 0.0,
                 _ => eprintln!("unknown tune key {k}"),
             }
         }
@@ -203,6 +222,9 @@ pub struct Bot {
     pub t: f64,
     blocked_pickups: HashMap<i64, f64>,
     loot_target: Option<(i64, f64)>,
+    cover_until: f64,
+    cover_spot: Option<(f64, f64)>,
+    cover_threats: Vec<[f64; 3]>,
     crate_target: Option<i64>,
     pub debug: bool,
     pub tune: Tune,
@@ -255,6 +277,9 @@ impl Bot {
             t: 0.0,
             blocked_pickups: HashMap::new(),
             loot_target: None,
+            cover_until: -1.0,
+            cover_spot: None,
+            cover_threats: Vec::new(),
             crate_target: None,
             debug: false,
             tune: Tune::default(),
@@ -473,10 +498,13 @@ impl Bot {
             let weak = tg.hp < tg.max_hp * 0.35;
             let healthy = hp_frac > self.tune.retreat_hp;
             let tn = &self.tune;
+            let our_laser = me.weapons.iter().flatten().any(|w| w.kind == "laser");
             if d < tn.fight_close
                 || (attacking_us && healthy && d < tn.fight_back_range)
+                || (attacking_us && our_laser && healthy && d < 250.0 && me.hp >= tg.hp * 0.9)
                 || (weak && healthy && d < tn.hunt_weak_range)
                 || (tn.aggressive && d < 200.0)
+                || tn.hunt
             {
                 fight = true;
             } else if attacking_us && tn.cover_from_far {
@@ -500,7 +528,24 @@ impl Bot {
             }
             if !cover_from.is_empty() {
                 mode = Mode::Cover;
+                if o.t > self.cover_until || recently_hurt {
+                    // (re)choose a spot when starting or when still being hit
+                    let moved = self.cover_threats.first().zip(cover_from.first()).map(|(a, b)| d2(*a, *b) > 25.0).unwrap_or(true);
+                    if self.cover_spot.is_none() || moved || recently_hurt {
+                        self.cover_spot = self.find_cover(o, &cover_from, None);
+                    }
+                    self.cover_threats = cover_from.clone();
+                    self.cover_until = o.t + self.tune.cover_hold_s;
+                }
+            } else if o.t < self.cover_until && self.tune.cover_from_far {
+                mode = Mode::Cover;
+                cover_from = self.cover_threats.clone();
             }
+        }
+        if mode != Mode::Cover && self.cover_spot.is_some() && o.t >= self.cover_until {
+            // cover over: re-choose the hold spot (the old one may be exposed to that threat)
+            self.cover_spot = None;
+            self.hold_spot = None;
         }
         if urgent && mode != Mode::Fight {
             mode = Mode::Rotate;
@@ -556,6 +601,16 @@ impl Bot {
                 let dir = self.walkable_dir(pos, dir);
                 mv = dir;
                 speed = 1.0;
+                let has_lightning = me.weapons.iter().flatten().any(|w| w.kind == "lightning");
+                if self.tune.boost_strafe && d > 20.0 && me.grounded && me.energy > if has_lightning { 70.0 } else { 35.0 } {
+                    boost = true;
+                }
+                if (self.tune.aggressive || self.tune.hunt) && d > pref + 40.0 {
+                    let (m, b, j) = self.go_to(o, tg.pos[0], tg.pos[1]);
+                    mv = m;
+                    boost = b;
+                    jump = j;
+                }
                 let (_, rnow) = o.zone.at(o.t);
                 if rnow < 40.0 || o.zone.next_radius <= 1.0 {
                     let (cf, _) = o.zone.at(o.t + 1.5);
@@ -569,7 +624,8 @@ impl Bot {
                 }
             }
             Mode::Cover => {
-                if let Some((gx, gy)) = self.find_cover(o, &cover_from, None) {
+                let spot = self.cover_spot.or_else(|| self.find_cover(o, &cover_from, None));
+                if let Some((gx, gy)) = spot {
                     let (m, b, j) = self.go_to(o, gx, gy);
                     mv = m;
                     boost = b;
@@ -674,6 +730,18 @@ impl Bot {
             || self.sounds.iter().any(|s| o.t - s.0 < 4.0 && s.2 == "near" && (s.3 == "step" || s.3 == "boost"));
         if enemy_near && !urgent && (mode == Mode::Hold || mode == Mode::Loot) {
             speed = speed.min(0.4);
+        }
+
+        // ---------------- dodge incoming mortar shells and bullets
+        if let Some(d) = if self.tune.dodge { self.dodge_dir(o) } else { None } {
+            let urgent_move = mode == Mode::Rotate && urgent;
+            if !urgent_move {
+                mv = self.walkable_dir(pos, d);
+                speed = 1.0;
+                if me.grounded && me.energy > 25.0 {
+                    boost = true;
+                }
+            }
         }
 
         // ---------------- stuck detection / recovery
@@ -988,6 +1056,90 @@ impl Bot {
         self.follow_path(o, &p)
     }
 
+    /// Direction to step to avoid a predicted mortar impact or an incoming bullet, if any.
+    fn dodge_dir(&mut self, o: &Obs) -> Option<[f64; 2]> {
+        let me = &o.me;
+        let pos = me.pos;
+        let w = self.world;
+        let g = self.cfg.w("mortar", "gravity", 22.0);
+        let splash = self.cfg.w("mortar", "splash_radius", 7.0) + 3.5;
+        let mut push = [0.0f64, 0.0];
+        let mut any = false;
+        for p in &o.projectiles {
+            if p.kind == "mortar" {
+                // integrate the shell until it hits the ground/roof (or 6 s)
+                let mut q = p.pos;
+                let mut v = p.vel;
+                let dt = 0.05;
+                let mut impact = None;
+                for _ in 0..120 {
+                    q = [q[0] + v[0] * dt, q[1] + v[1] * dt, q[2] + v[2] * dt];
+                    v[2] -= g * dt;
+                    let ground = match w {
+                        Some(w) => w.support(q[0] as f32, q[1] as f32, q[2] as f32, 0.0) as f64,
+                        None => pos[2],
+                    };
+                    let hits_mech = ((q[0] - pos[0]).powi(2) + (q[1] - pos[1]).powi(2)).sqrt() < 2.8 && q[2] > pos[2] && q[2] < pos[2] + 9.0;
+                    if q[2] <= ground || hits_mech {
+                        impact = Some(q);
+                        break;
+                    }
+                }
+                if let Some(ip) = impact {
+                    let dx = pos[0] - ip[0];
+                    let dy = pos[1] - ip[1];
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d < splash {
+                        let k = (splash - d) / splash + 0.2;
+                        if d < 0.5 {
+                            // dead center: step sideways to the shell's flight direction
+                            let n = (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sqrt().max(1e-6);
+                            push[0] += -p.vel[1] / n * k;
+                            push[1] += p.vel[0] / n * k;
+                        } else {
+                            push[0] += dx / d * k;
+                            push[1] += dy / d * k;
+                        }
+                        any = true;
+                    }
+                }
+            } else {
+                // straight bullet: will it pass within our radius soon?
+                let rel = [pos[0] - p.pos[0], pos[1] - p.pos[1], pos[2] + 4.5 - p.pos[2]];
+                let vv = p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1] + p.vel[2] * p.vel[2];
+                if vv < 1.0 {
+                    continue;
+                }
+                let tc = (rel[0] * p.vel[0] + rel[1] * p.vel[1] + rel[2] * p.vel[2]) / vv;
+                if !(0.12..=0.8).contains(&tc) {
+                    continue; // too late to react, or receding / far
+                }
+                let cx = p.pos[0] + p.vel[0] * tc - pos[0];
+                let cy = p.pos[1] + p.vel[1] * tc - pos[1];
+                let miss = (cx * cx + cy * cy).sqrt();
+                if miss < 3.0 {
+                    let n = (p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1]).sqrt().max(1e-6);
+                    let mut side = [-p.vel[1] / n, p.vel[0] / n];
+                    // step to the side that increases the miss distance
+                    if side[0] * cx + side[1] * cy > 0.0 {
+                        side = [-side[0], -side[1]];
+                    }
+                    push[0] += side[0] * 0.5;
+                    push[1] += side[1] * 0.5;
+                    any = true;
+                }
+            }
+        }
+        if !any {
+            return None;
+        }
+        let n = (push[0] * push[0] + push[1] * push[1]).sqrt();
+        if n < 1e-6 {
+            return None;
+        }
+        Some([push[0] / n, push[1] / n])
+    }
+
     /// Bend a desired direction so a short step along it stays walkable.
     fn walkable_dir(&self, pos: [f64; 3], dir: [f64; 2]) -> [f64; 2] {
         let w = match self.world {
@@ -1051,8 +1203,8 @@ impl Bot {
 
     fn weapon_rank(kind: &str) -> i32 {
         match kind {
-            "lightning" => 3,
-            "laser" => 2,
+            "laser" => 3,
+            "lightning" => 2,
             "mortar" => 1,
             _ => 0,
         }
@@ -1082,7 +1234,8 @@ impl Bot {
             }
             let d = d2(p.pos, pos);
             let dz = (p.pos[2] - pos[2]).abs();
-            if d > 70.0 || dz > 8.0 {
+            let lr = if slot1_empty { self.tune.loot_radius } else { 70.0 };
+            if d > lr || dz > 8.0 {
                 continue;
             }
             if !self.point_safe(o, p.pos[0], p.pos[1], 15.0, 8.0) {
