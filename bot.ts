@@ -19,7 +19,7 @@ const UPGRADE_PREF = [
 ]
 
 class Brain {
-  name = "TTUN-mech"
+  name = "Team-Xero"
   cfg: any
   map: WorldMap | null = null
   tracks = new Map<number, Track>()
