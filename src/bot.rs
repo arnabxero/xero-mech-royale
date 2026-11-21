@@ -111,6 +111,13 @@ pub struct Tune {
     pub ffa_avoid_r: f64,
     /// deaths not caused by us that mark the match as a free-for-all
     pub ffa_deaths: f64,
+    /// after a kill, if HP is below this fraction, hide from all known enemies and heal
+    /// (up to post_kill_s seconds or until HP is back) before taking the next fight (0 = off)
+    pub post_kill_heal: f64,
+    pub post_kill_s: f64,
+    /// upgrade priority: 0 = plating > armor > nanites > weapons, 1 = sustain (nanites > plating >
+    /// armor), 2 = damage (gun rate/damage, laser damage/charge > plating > armor)
+    pub upg_mode: f64,
     /// retreat threshold (HP fraction) while 2+ distinct attackers hit us within 6 s (0 = off)
     pub gang_retreat_hp: f64,
     /// cube pickup search radius (m)
@@ -174,6 +181,9 @@ impl Default for Tune {
             avoid_silent: false,
             ffa_avoid_r: 200.0,
             ffa_deaths: 2.0,
+            post_kill_heal: 0.0,
+            post_kill_s: 30.0,
+            upg_mode: 0.0,
             gang_retreat_hp: 0.0,
             cube_radius: 60.0,
             kill_loot: 0.0,
@@ -252,6 +262,9 @@ impl Tune {
                 "avoid_silent" => self.avoid_silent = v != 0.0,
                 "ffa_avoid_r" => self.ffa_avoid_r = v,
                 "ffa_deaths" => self.ffa_deaths = v,
+                "post_kill_heal" => self.post_kill_heal = v,
+                "post_kill_s" => self.post_kill_s = v,
+                "upg_mode" => self.upg_mode = v,
                 "gang_retreat_hp" => self.gang_retreat_hp = v,
                 "kill_loot" => self.kill_loot = v,
                 "loot_radius_full" => self.loot_radius_full = v,
@@ -368,6 +381,8 @@ pub struct Bot {
     kill_spots: Vec<([f64; 3], f64)>,
     our_kills: u32,
     pub ffa_detected: bool,
+    last_kill_t: f64,
+    heal_spot: Option<(f64, f64)>,
     cover_until: f64,
     cover_spot: Option<(f64, f64)>,
     cover_threats: Vec<[f64; 3]>,
@@ -432,6 +447,8 @@ impl Bot {
             kill_spots: Vec::new(),
             our_kills: 0,
             ffa_detected: false,
+            last_kill_t: -99.0,
+            heal_spot: None,
             cover_until: -1.0,
             cover_spot: None,
             cover_threats: Vec::new(),
@@ -543,6 +560,8 @@ impl Bot {
                 }
                 "kill" => {
                     self.our_kills += 1;
+                    self.last_kill_t = t;
+                    self.heal_spot = None;
                     if let Some(tid) = ev.target {
                         if let Some(tr) = self.tracks.get(&(tid as i64)) {
                             self.kill_spots.push((tr.pos, t));
@@ -878,6 +897,31 @@ impl Bot {
         }
         if urgent && mode == Mode::Fight && t_out < need_t + 4.0 {
             mode = Mode::Rotate; // run, shooting on the way
+        }
+
+        // ---------------- recover after a kill: hide from every known enemy and heal
+        if self.tune.post_kill_heal > 0.0
+            && o.t - self.last_kill_t < self.tune.post_kill_s
+            && hp_frac < self.tune.post_kill_heal
+            && !urgent
+            && enemies.iter().all(|e| d2(e.pos, pos) > 45.0)
+            && matches!(mode, Mode::Rotate | Mode::Fight | Mode::Cover)
+        {
+            let threats: Vec<[f64; 3]> = self
+                .tracks
+                .values()
+                .filter(|t| !t.is_npc && o.t - t.seen_t < 20.0)
+                .map(|t| t.pos)
+                .collect();
+            if self.heal_spot.is_none() {
+                self.heal_spot = if threats.is_empty() { None } else { self.find_cover(o, &threats, attacker_bearing) };
+            }
+            if let Some(hs) = self.heal_spot {
+                mode = Mode::Cover;
+                cover_from = threats;
+                self.cover_spot = Some(hs);
+                self.cover_until = self.cover_until.max(o.t + 1.0);
+            }
         }
 
         // loot / drops when calm
@@ -1679,7 +1723,18 @@ impl Bot {
         let mut best = 0usize;
         let mut bs = i32::MIN;
         for (i, ch) in off.choices.iter().enumerate() {
-            let s = match ch.id.as_str() {
+            let mode = self.tune.upg_mode as i32;
+            let bonus = match (mode, ch.id.as_str()) {
+                (1, "nanites") => 50,
+                (1, "plating") => 5,
+                (2, "gun_rate") => 70,
+                (2, "gun_damage") => 68,
+                (2, "laser_damage") if has("laser") => 75,
+                (2, "laser_charge") if has("laser") => 72,
+                (2, "lightning_efficiency") if has("lightning") => 60,
+                _ => 0,
+            };
+            let s = bonus + match ch.id.as_str() {
                 "plating" => 100,
                 "armor" => 90,
                 "nanites" => 70,

@@ -82,6 +82,8 @@ pub struct SimMech {
     /// recent damage log (t, attacker, weapon, amount) for death diagnostics
     pub dmg_log: Vec<(f64, usize, String, f64)>,
     pub death_diag: String,
+    /// time and HP fraction at our most recent kill
+    pub last_kill: (f64, f64),
     /// damage taken from behind (x1.5 already applied) and in total, from mechs
     pub dmg_rear: f64,
     pub dmg_mech: f64,
@@ -333,6 +335,7 @@ impl<'a> Ffa<'a> {
                 laser_hits: 0,
                 dmg_log: Vec::new(),
                 death_diag: String::new(),
+                last_kill: (-1.0, 0.0),
                 dmg_rear: 0.0,
                 dmg_mech: 0.0,
                 seen_s: 0.0,
@@ -774,6 +777,8 @@ impl<'a> Ffa<'a> {
             self.mechs[target].killer = Some(by);
             self.kill(target, false);
             self.mechs[by].kills += 1;
+            let (t_now, hpf) = (self.t, self.mechs[by].hp / self.mechs[by].max_hp.max(1.0));
+            self.mechs[by].last_kill = (t_now, hpf);
             self.mechs[by].events.push(Event { kind: "kill".into(), target: Some(target as f64), ..Default::default() });
             // death drop: cubes + 2, non-gun weapons
             let p = self.mechs[target].body.pos;
@@ -859,7 +864,9 @@ impl<'a> Ffa<'a> {
             let first_hit = m.dmg_log.first().map(|d| d.0).unwrap_or(self.t);
             let weapons: Vec<String> = m.weapons.iter().flatten().map(|w| w.kind.clone()).collect();
             m.death_diag = format!(
-                "DIAG att10={} laser10={:.0} gun10={:.0} other10={:.0} first_hit={:.0} weapons={} zone={}",
+                "DIAG lastkill_t={:.0} lastkill_hp={:.2} att10={} laser10={:.0} gun10={:.0} other10={:.0} first_hit={:.0} weapons={} zone={}",
+                m.last_kill.0,
+                m.last_kill.1,
                 att.len(),
                 by_w("laser"),
                 by_w("gun"),
