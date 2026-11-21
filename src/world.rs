@@ -808,7 +808,8 @@ impl World {
             Some(c) => c,
             None => return true,
         };
-        if z < self.terr[c] - 0.2 {
+        // cheap reject far above the local terrain, else exact bilinear test
+        if z < self.terr[c] + 1.5 && z < self.ground(x, y) - 0.05 {
             return true;
         }
         if self.flags[c] & HAS_IV == 0 {

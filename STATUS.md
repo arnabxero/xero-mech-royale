@@ -1,6 +1,6 @@
 # STATUS: xero-mech (Mech Royale)
 
-_Last updated: Sat 2026-11-21 early (v4)_
+_Last updated: Fri 2026-11-20 late (v5)_
 
 ## Versions
 | Version | Commit | Practice (48 vs house squad) | Notes |
@@ -9,8 +9,8 @@ _Last updated: Sat 2026-11-21 early (v4)_
 | v2 | 686ba81 | **2.67** (rank 48/79) | concealment hold spots, canopy model, engagement policy, loot/stuck fixes |
 | v3 / v3.1 | 4fded0d / afe5742 | **3.00** (A) | laser-first loot, persistent cover + re-chosen hold spot, bullet/mortar dodging |
 | v3.1-duel | 81cb33a (branch variant-duel) | **3.19** (B) | same + `ENV XERO_TUNE=solo_duel=1` |
-| v4 | 8dfdbd6 | submitted 8:01 PM CST | blind return fire (ghost tracks), laser-charge ducking, wall-at-back hold scanning, pickup memory + travel sweep |
-| v4.1 | see `git log` (the "v4.1:" commit) | not yet submitted | v4 + solo duel ON + proactive solo engagement (HP>70%) + NPC drone farming for cubes |
+| v4 | 8dfdbd6 | **3.35** | blind return fire (ghost tracks), laser-charge ducking, wall-at-back hold scanning, pickup memory + travel sweep |
+| v4.1 | 51c8fd4 | **2.98** | v4 + solo duel ON + proactive solo engagement (HP>70%) + NPC drone farming for cubes |
 
 ## Submittable?
 **Yes.** The `Dockerfile` at the top level builds the Rust bot and passes the sandboxed `check.py`.
@@ -24,6 +24,29 @@ _Last updated: Sat 2026-11-21 early (v4)_
 - `ready` arrives in ~0.4 s in Docker. The world build takes ~170 ms.
 - The p99 comes from the time-sliced Dijkstra flow field, which runs last in each decision and
   stops at 14 ms after the observation arrived. Normal decisions take ~0.1-1 ms.
+
+| v5 | see `git log` (the "v5:" commit) | pending | **v4 behaviour + aiming execution fixes** (v4.1 policy changes off by default) |
+
+## Changes in v5 (vs v4; the v4.1 policy changes are switched off again)
+Practice ranked v4 (3.35) above v4.1 (2.98), so v5 keeps v4's behaviour: solo duel off, no proactive
+engagement, no drone farming or drone fight-back. All of those remain available as `XERO_TUNE`
+switches. The changes are pure execution fixes, found with clean accuracy stats from the simulator:
+- **LOS-aware aim point**: aim at the first body point (center, +2 m, +3.6 m) with a clear line. At
+  range, terrain often hides the lower body, and shots at the center hit the ground.
+- **Laser/gun aim hand-off**: the torso follows the gun's lead aim while the laser charges, then
+  switches to the laser aim (with a 75 ms release lead) once the charge is 80% full. The release
+  tolerance is tightened to ~1.6 m at the target. Laser accuracy in sim laser duels went from 31% to ~65%.
+- **No wasted laser shots**: a charge is held, not dumped, when the target drops out of view.
+  During peek-fighting the bot steps out before the server's auto-release would fire it into the wall.
+- **No gun spam beyond 140 m at strafing targets** (sim hit rate there ~10%). This saves the
+  magazine for closer range.
+- World: LOS uses bilinear terrain instead of the nearest vertex.
+- Sim: frozen opponent copy (`src/oppbot.rs`) so our changes don't alter the opponents. Practice-like
+  `squad2` mode, NPC drones + cubes, accuracy stats, shared flow fields, server scripts
+  (`tools/inner_bench.sh`, `tools/server_bench.sh`).
+
+Conformance (server, sandboxed docker, 1 pinned core): PASS 300/300, answer ms p50 0.4 / p90 0.7 /
+p99 14.7 / max 17.1.
 
 ## Changes in v4.1 (vs v4)
 **Practice score is now the gate (top 32 of 93 qualify).** Practice ≈ number of hunters that die

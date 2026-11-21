@@ -67,8 +67,13 @@ pub struct Tune {
     pub solo_first_hp: f64,
     /// farm NPC drones for cubes when calm, until this match time
     pub npc_farm_until: f64,
+    /// shoot back at NPC drones that attack us (otherwise treat their fire like any far attacker)
+    pub npc_fight: bool,
     /// simulator only: aiming error (radians, persistent for 0.5 s) to model weaker opponents
     pub aim_noise: f64,
+    /// v5 aiming: LOS-aware aim point, laser/gun aim hand-off, no wasted laser releases,
+    /// no long-range gun spam at strafing targets
+    pub aim_v2: bool,
     /// sidestep incoming bullets and mortar impacts
     pub dodge: bool,
 }
@@ -91,11 +96,13 @@ impl Default for Tune {
             boost_strafe: false,
             loot_radius: 70.0,
             cover_hold_s: 8.0,
-            solo_duel: true,
+            solo_duel: false,
             peek: true,
-            solo_first_hp: 0.7,
-            npc_farm_until: 300.0,
+            solo_first_hp: 2.0,
+            npc_farm_until: 0.0,
+            npc_fight: false,
             aim_noise: 0.0,
+            aim_v2: true,
             dodge: true,
         }
     }
@@ -143,7 +150,9 @@ impl Tune {
                 "peek" => self.peek = v != 0.0,
                 "solo_first_hp" => self.solo_first_hp = v,
                 "npc_farm_until" => self.npc_farm_until = v,
+                "npc_fight" => self.npc_fight = v != 0.0,
                 "aim_noise" => self.aim_noise = v,
+                "aim_v2" => self.aim_v2 = v != 0.0,
                 "dodge" => self.dodge = v != 0.0,
                 _ => eprintln!("unknown tune key {k}"),
             }
@@ -492,10 +501,22 @@ impl Bot {
         let (cx, cy, r, inner) = self.zone_target(o);
         let tag = (cx.round() as i64, cy.round() as i64, (r * 10.0).round() as i64);
         if self.ff_next.tag != tag && !(self.ff.tag == tag && self.ff_ready) {
-            self.ff_next.start_disc(w, tag, cx as f32, cy as f32, r as f32, 40);
+            let cached = if crate::nav::shared::enabled() { crate::nav::shared::get(tag) } else { None };
+            if let Some(c) = cached {
+                self.ff_next.dist.copy_from_slice(&c.0);
+                self.ff_next.next.copy_from_slice(&c.1);
+                self.ff_next.radius = c.2;
+                self.ff_next.tag = tag;
+                self.ff_next.done = true;
+            } else {
+                self.ff_next.start_disc(w, tag, cx as f32, cy as f32, r as f32, 40);
+            }
         }
         if self.ff_next.tag == tag && !self.ff_next.done {
             self.ff_next.run(w, deadline);
+            if self.ff_next.done && crate::nav::shared::enabled() {
+                crate::nav::shared::put(tag, &self.ff_next.dist, &self.ff_next.next, self.ff_next.radius);
+            }
         }
         if self.ff_next.tag == tag && self.ff_next.done && self.ff.tag != tag {
             std::mem::swap(&mut self.ff, &mut self.ff_next);
@@ -592,7 +613,7 @@ impl Bot {
         let attacker_bearing = self.dmg_log.iter().rev().find(|d| o.t - d.0 < 1.5 && d.1.is_some()).and_then(|d| d.1);
         // NPC drones: kill the ones shooting us; farm them for cubes when nothing else is around
         let mut npc_target: Option<Track> = None;
-        if target.is_none() {
+        if target.is_none() && (self.tune.npc_fight || self.tune.npc_farm_until > 0.0) {
             let mech_recent = self.tracks.values().any(|t| !t.is_npc && o.t - t.seen_t < 6.0);
             let mut bs = f64::MAX;
             for t in self.tracks.values() {
@@ -1319,9 +1340,13 @@ impl Bot {
         let our_laser = me.weapons.iter().flatten().find(|w| w.kind == "laser");
         let charging_ours = our_laser.map(|l| l.charge.unwrap_or(0.0) > 0.0).unwrap_or(false);
         let our_full = our_laser.map(|l| l.charge.unwrap_or(0.0) >= l.stat("charge", 0.75) * 0.95).unwrap_or(false);
+        // a full charge auto-fires hold_s after full: step out before it is wasted into the wall
+        let must_shoot = self.tune.aim_v2 && our_laser
+            .map(|l| l.charge.unwrap_or(0.0) > l.stat("charge", 0.75) + l.stat("hold_s", 2.0) * 0.55)
+            .unwrap_or(false);
         let hp_frac = me.hp / me.max_hp.max(1.0);
         // hide while their laser is charged/charging, while ours is still charging, or to heal
-        let hide = tg.charging || (charging_ours && !our_full) || (hp_frac < 0.3 && tg.hp > me.hp);
+        let hide = !must_shoot && (tg.charging || (charging_ours && !our_full) || (hp_frac < 0.3 && tg.hp > me.hp));
         let goal = if hide { h } else { v };
         let dx = goal.0 - pos[0];
         let dy = goal.1 - pos[1];
@@ -1798,13 +1823,31 @@ impl Bot {
                 let uy = (tg.pos[1] - pos[1]) / d.max(0.1);
                 center = [center[0] - uy * d * self.noise_off[0], center[1] + ux * d * self.noise_off[0], center[2] + d * self.noise_off[1]];
             }
+            // aim at the first body point with a clear line (terrain often hides the lower body at range)
+            let mut center = center;
+            let mut los = false;
+            let dzs: &[f64] = if self.tune.aim_v2 { &[0.0, 2.0, 3.6] } else { &[0.0] };
+            for &dz in dzs {
+                let p = [center[0], center[1], center[2] + dz];
+                if has_los(muzzle, p) {
+                    center = p;
+                    los = true;
+                    break;
+                }
+            }
+            if !self.tune.aim_v2 {
+                los = los || has_los(muzzle, [tg.pos[0], tg.pos[1], tg.pos[2] + 7.5]);
+            }
             let center = center;
-            let los = has_los(muzzle, center) || has_los(muzzle, [tg.pos[0], tg.pos[1], tg.pos[2] + 7.5]);
             let shoot_ok = mode == Mode::Fight || mode == Mode::Retreat || mode == Mode::Cover || (o.t - tg.hurt_us_t < 4.0) || d < 50.0 || self.tune.aggressive;
             if shoot_ok {
                 engaged = true;
                 // choose weapon per slot
                 let mut desired: Option<[f64; 2]> = None;
+                let laser_phase = self.tune.aim_v2
+                    && me.weapons.iter().flatten().any(|w| w.kind == "laser" && w.charge.unwrap_or(0.0) >= w.stat("charge", 0.75) * 0.8);
+                let has_gun = me.weapons.iter().flatten().any(|w| w.kind == "gun");
+                let tspeed = (tg.vel[0] * tg.vel[0] + tg.vel[1] * tg.vel[1]).sqrt();
                 for (si, wo) in me.weapons.iter().enumerate().take(2) {
                     let wo = match wo {
                         Some(w) => w,
@@ -1815,12 +1858,14 @@ impl Bot {
                             let speed = wo.stat("speed", 252.0);
                             let range = wo.stat("range", 230.0);
                             let a = lead_aim(muzzle, center, tg.vel, speed);
-                            if desired.is_none() {
+                            if desired.is_none() && !laser_phase {
                                 desired = Some(a);
                             }
                             let err = ang_err(me.aim, a);
                             let tol = (2.0f64 / d.max(1.0)).atan() + 0.01;
-                            if los && d < range * 0.98 && err < tol && wo.cooldown <= 0.0 && wo.ammo.unwrap_or(1.0) > 0.0 {
+                            // beyond ~140 m a strafing target is almost never hit (sim: ~10%)
+                            let worth = !self.tune.aim_v2 || d < 140.0 || tspeed < 4.0 || tg.ghost;
+                            if los && worth && d < range * 0.98 && err < tol && wo.cooldown <= 0.0 && wo.ammo.unwrap_or(1.0) > 0.0 {
                                 fire[si] = true;
                             }
                         }
@@ -1844,16 +1889,16 @@ impl Bot {
                                 let h = d.max(0.1);
                                 (center[2] - muzzle[2]).atan2(h)
                             }];
-                            // lead a little for the remaining charge time? hitscan: aim at predicted pos at release
-                            let rem = (full - charge).max(0.0);
-                            let pc = [center[0] + tg.vel[0] * rem * 0.5, center[1] + tg.vel[1] * rem * 0.5, center[2]];
+                            // hitscan: aim where the target will be when the release takes effect (~0.075 s)
+                            let lt = 0.075;
+                            let pc = [center[0] + tg.vel[0] * lt, center[1] + tg.vel[1] * lt, center[2]];
                             let a2 = [(pc[1] - muzzle[1]).atan2(pc[0] - muzzle[0]), (pc[2] - muzzle[2]).atan2(d2(pc, muzzle).max(0.1))];
                             let _ = a;
-                            if desired.is_none() || d > 50.0 {
+                            if laser_phase || !has_gun || desired.is_none() || (!self.tune.aim_v2 && d > 50.0) {
                                 desired = Some(a2);
                             }
                             let err = ang_err(me.aim, a2);
-                            let tol = (2.0f64 / d.max(1.0)).atan() + 0.008;
+                            let tol = if self.tune.aim_v2 { (1.6f64 / d.max(1.0)).atan() + 0.002 } else { (2.0f64 / d.max(1.0)).atan() + 0.008 };
                             if d < range * 0.97 {
                                 if charge <= 0.0 {
                                     // start charging only if cooled down and roughly aimed
@@ -1896,12 +1941,12 @@ impl Bot {
                 }
             }
         }
-        // laser: never hold a charge we don't need
+        // laser: keep a charge we already have (an early release is a wasted shot + cooldown)
         if !engaged {
             for (si, wo) in me.weapons.iter().enumerate().take(2) {
                 if let Some(wo) = wo {
                     if wo.kind == "laser" && wo.charge.unwrap_or(0.0) > 0.0 {
-                        fire[si] = false;
+                        fire[si] = self.tune.aim_v2;
                     }
                 }
             }

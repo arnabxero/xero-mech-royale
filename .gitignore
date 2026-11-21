@@ -4,3 +4,5 @@
 /tmp/
 bench_last.txt
 /bench_out/
+/target-docker/
+/target2/

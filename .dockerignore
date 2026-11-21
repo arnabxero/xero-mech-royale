@@ -1,5 +1,9 @@
 target
+target-*
+target2
 .git
 *.log
 out
 tools
+bench_out
+bench_last.txt

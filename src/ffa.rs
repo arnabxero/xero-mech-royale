@@ -3,6 +3,7 @@
 //! rear armor, regen, zone damage and placement. Opponents are scripted bots modelled on the kit
 //! example (walk to the zone center, shoot the nearest visible mech) plus variants.
 use crate::bot::{wrap, Bot, Rng};
+use crate::oppbot::Bot as OppBot;
 use crate::proto::*;
 use crate::sim::*;
 use crate::world::World;
@@ -18,6 +19,8 @@ pub enum Kind {
     Example,
     Rusher,
     Camper,
+    /// stands still (or strafes if DUMMY_STRAFE is set), never shoots: aim test target
+    Dummy,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +60,7 @@ pub struct SimMech {
     pub beams: Vec<BeamObs>,
     pub act: Action,
     pub bot: Option<Bot>,
+    pub opp: Option<OppBot>,
     pub step_t: f64,
     pub kills: u32,
     pub dmg_dealt: f64,
@@ -66,6 +70,11 @@ pub struct SimMech {
     pub killer: Option<usize>,
     pub mode_at_death: String,
     pub cubes: f64,
+    /// gun shots fired at mechs / hits on mechs, bucketed by range (<60, <120, >=120 m)
+    pub shots: [u32; 3],
+    pub hits: [u32; 3],
+    pub laser_shots: u32,
+    pub laser_hits: u32,
     /// seconds during which at least one living enemy could see this mech
     pub seen_s: f64,
     /// seconds alive
@@ -75,6 +84,8 @@ pub struct SimMech {
 }
 
 struct Bullet {
+    /// range bucket of the nearest enemy mech when fired (for accuracy stats)
+    bucket: usize,
     owner: usize,
     /// fired by NPC drone `owner` (index into npcs) instead of a mech
     npc: bool,
@@ -189,26 +200,32 @@ impl<'a> Ffa<'a> {
             if duel && spawns.len() == 1 && dist2(spawns[0], [x, y, 0.0]) > 200.0 {
                 continue;
             }
+            if let Some(r) = std::env::var("AIMTEST_RANGE").ok().and_then(|v| v.parse::<f64>().ok()) {
+                if spawns.len() == 1 {
+                    let dd = dist2(spawns[0], [x, y, 0.0]);
+                    if (dd - r).abs() > 5.0 {
+                        continue;
+                    }
+                    let a = [spawns[0][0] as f32, spawns[0][1] as f32, spawns[0][2] as f32 + 7.0];
+                    if !w.los(a, [x as f32, y as f32, w.floor[c] + 4.5]) {
+                        continue;
+                    }
+                }
+            }
             spawns.push([x, y, w.floor[c] as f64]);
         }
         let mut mechs = Vec::new();
         for (i, k) in kinds.iter().enumerate() {
-            let bot = match k {
-                Kind::Ours => {
-                    let mut b = Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
-                    if let Ok(spec) = std::env::var("XERO_TUNE") {
-                        b.tune.apply(&spec);
-                    }
-                    Some(b)
-                }
+            let opp: Option<OppBot> = match k {
                 Kind::Aggro => {
-                    let mut b = Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
-                    b.tune = crate::bot::Tune::aggressive();
+                    let mut b = OppBot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
+                    b.tune = crate::oppbot::Tune::aggressive();
                     Some(b)
                 }
                 Kind::Squad2 => {
-                    let mut b = Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
-                    b.tune.fight_close = 45.0;
+                    let mut b = OppBot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
+                    // non-hunters ignore us unless we shoot them (SQUAD_PASSIVE=0 makes them engage within 45 m)
+                    b.tune.fight_close = if std::env::var("SQUAD_PASSIVE").map(|v| v == "0").unwrap_or(false) { 45.0 } else { 0.0 };
                     b.tune.fight_back_range = 230.0;
                     b.tune.cover_from_far = false;
                     b.tune.retreat_hp = 0.0;
@@ -218,13 +235,22 @@ impl<'a> Ffa<'a> {
                     Some(b)
                 }
                 Kind::Squad => {
-                    // non-hunting squad members hold the zone and only engage us up close
-                    let mut b = Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
+                    let mut b = OppBot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
                     b.tune.fight_close = 100.0;
                     b.tune.fight_back_range = 230.0;
                     b.tune.cover_from_far = false;
                     b.tune.retreat_hp = 0.0;
                     b.tune.dodge = false;
+                    Some(b)
+                }
+                _ => None,
+            };
+            let bot = match k {
+                Kind::Ours => {
+                    let mut b = Bot::new(cfg.clone(), Some(w), i as i64, seed * 31 + i as u64);
+                    if let Ok(spec) = std::env::var("XERO_TUNE") {
+                        b.tune.apply(&spec);
+                    }
                     Some(b)
                 }
                 _ => None,
@@ -261,6 +287,7 @@ impl<'a> Ffa<'a> {
                 beams: vec![],
                 act: Action::default(),
                 bot,
+                opp,
                 step_t: 0.0,
                 kills: 0,
                 dmg_dealt: 0.0,
@@ -270,6 +297,10 @@ impl<'a> Ffa<'a> {
                 killer: None,
                 mode_at_death: String::new(),
                 cubes: 0.0,
+                shots: [0; 3],
+                hits: [0; 3],
+                laser_shots: 0,
+                laser_hits: 0,
                 seen_s: 0.0,
                 alive_s: 0.0,
                 modes: HashMap::new(),
@@ -293,7 +324,8 @@ impl<'a> Ffa<'a> {
         }
         let mut npcs = Vec::new();
         let mut tries = 0;
-        while npcs.len() < 12 && tries < 100_000 {
+        let n_npc = if std::env::var("SIM_NO_NPC").is_ok() { 0 } else { 12 };
+        while npcs.len() < n_npc && tries < 100_000 {
             tries += 1;
             let x = w.bounds[0] as f64 + 40.0 + rng.f() * (w.bounds[1] - w.bounds[0] - 80.0) as f64;
             let y = w.bounds[2] as f64 + 40.0 + rng.f() * (w.bounds[3] - w.bounds[2] - 80.0) as f64;
@@ -312,7 +344,7 @@ impl<'a> Ffa<'a> {
         let mut grade = 0usize;
         for m in f.mechs.iter_mut() {
             if m.kind == Kind::Squad2 {
-                if let Some(b) = m.bot.as_mut() {
+                if let Some(b) = m.opp.as_mut() {
                     b.tune.aim_noise = base_noise * (1.0 - grade as f64 / 16.0);
                 }
                 if grade >= laser_from {
@@ -326,7 +358,7 @@ impl<'a> Ffa<'a> {
         if f.mechs.len() == 2 {
             for m in f.mechs.iter_mut() {
                 if m.kind == Kind::Aggro {
-                    if let Some(b) = m.bot.as_mut() {
+                    if let Some(b) = m.opp.as_mut() {
                         b.tune.hunt = true;
                     }
                 }
@@ -368,9 +400,9 @@ impl<'a> Ffa<'a> {
         }
         if let Some(j) = best {
             self.hunters.push(j);
-            if let Some(b) = self.mechs[j].bot.as_mut() {
+            if let Some(b) = self.mechs[j].opp.as_mut() {
                 let noise = b.tune.aim_noise;
-                b.tune = crate::bot::Tune::aggressive();
+                b.tune = crate::oppbot::Tune::aggressive();
                 b.tune.hunt = true;
                 b.tune.dodge = false;
                 b.tune.solo_duel = false;
@@ -578,6 +610,14 @@ impl<'a> Ffa<'a> {
 
     fn scripted(&mut self, i: usize, o: &Obs) -> Action {
         let kind = self.mechs[i].kind;
+        if kind == Kind::Dummy {
+            let mut a = Action { tick: tick_value(o.tick), aim: o.me.aim, ..Default::default() };
+            if std::env::var("DUMMY_STRAFE").is_ok() {
+                let ph = ((o.t / 1.3).floor() as i64) % 2;
+                a.r#move = if ph == 0 { [0.0, 1.0] } else { [0.0, -1.0] };
+            }
+            return a;
+        }
         let me = &o.me;
         let (x, y, z) = (me.pos[0], me.pos[1], me.pos[2]);
         let goal = o.zone.next_center;
@@ -747,7 +787,7 @@ impl<'a> Ffa<'a> {
             return;
         }
         m.alive = false;
-        m.mode_at_death = m.bot.as_ref().map(|b| b.label.clone()).unwrap_or_default();
+        m.mode_at_death = m.bot.as_ref().map(|b| b.label.clone()).or_else(|| m.opp.as_ref().map(|b| b.label.clone())).unwrap_or_default();
         m.place = self.alive;
         m.death_t = self.t;
         m.killed_by_zone = zone;
@@ -763,10 +803,10 @@ impl<'a> Ffa<'a> {
         if self.t >= self.all_hunt_t && self.tick % 20 == 0 {
             for j in 0..n {
                 if self.mechs[j].kind == Kind::Squad || self.mechs[j].kind == Kind::Squad2 {
-                    if let Some(b) = self.mechs[j].bot.as_mut() {
+                    if let Some(b) = self.mechs[j].opp.as_mut() {
                         if !b.tune.hunt {
                             let noise = b.tune.aim_noise;
-                            b.tune = crate::bot::Tune::aggressive();
+                            b.tune = crate::oppbot::Tune::aggressive();
                             b.tune.hunt = true;
                             b.tune.dodge = false;
                             b.tune.solo_duel = false;
@@ -799,6 +839,10 @@ impl<'a> Ffa<'a> {
                 let act = if self.mechs[i].bot.is_some() {
                     let t0 = Instant::now();
                     let b = self.mechs[i].bot.as_mut().unwrap();
+                    b.act(&o, t0 + Duration::from_millis(self.budget_ms))
+                } else if self.mechs[i].opp.is_some() {
+                    let t0 = Instant::now();
+                    let b = self.mechs[i].opp.as_mut().unwrap();
                     b.act(&o, t0 + Duration::from_millis(self.budget_ms))
                 } else {
                     self.scripted(i, &o)
@@ -852,7 +896,7 @@ impl<'a> Ffa<'a> {
                     line += &format!(
                         " | #{j} {:?} d={:.0} hp={:.0} we_see={} it_sees={} charging={} {}",
                         e.kind, d, e.hp, self.can_see(i, j) as u8, self.can_see(j, i) as u8, e.laser_charging as u8,
-                        e.bot.as_ref().map(|b| b.label.clone()).unwrap_or_default()
+                        e.opp.as_ref().map(|b| b.label.clone()).unwrap_or_default()
                     );
                 }
                 eprintln!("{line}");
@@ -966,7 +1010,33 @@ impl<'a> Ffa<'a> {
                     let yaw = m.aim[0] + ny;
                     let pitch = m.aim[1] + np;
                     let v = [pitch.cos() * yaw.cos() * 252.0, pitch.cos() * yaw.sin() * 252.0, pitch.sin() * 252.0];
-                    self.bullets.push(Bullet { owner: i, npc: false, pos: start, vel: v, dist_left: 230.0, dmg: 45.0 });
+                    let near = (0..n)
+                        .filter(|&j| j != i && self.mechs[j].alive)
+                        .map(|j| dist2(self.mechs[j].body.pos, muzzle))
+                        .fold(f64::MAX, f64::min);
+                    let bucket = if near < 60.0 { 0 } else if near < 120.0 { 1 } else { 2 };
+                    if std::env::var("SHOT_DEBUG").is_ok() && self.mechs[i].kind == Kind::Ours {
+                        // closest approach of the (spread-free and actual) shot to each other mech's axis
+                        for j in 0..n {
+                            if j == i || !self.mechs[j].alive {
+                                continue;
+                            }
+                            let tp = self.mechs[j].body.pos;
+                            let c = [tp[0], tp[1], tp[2] + 4.5];
+                            let rel = [c[0] - start[0], c[1] - start[1], c[2] - start[2]];
+                            let tt = rel[0] * dir[0] + rel[1] * dir[1] + rel[2] * dir[2];
+                            let q = [start[0] + dir[0] * tt - c[0], start[1] + dir[1] * tt - c[1], start[2] + dir[2] * tt - c[2]];
+                            let horiz = (q[0] * q[0] + q[1] * q[1]).sqrt();
+                            let want_yaw = (c[1] - muzzle[1]).atan2(c[0] - muzzle[0]);
+                            let want_pitch = (c[2] - muzzle[2]).atan2(dist2(c, muzzle));
+                            eprintln!(
+                                "SHOT t={:.2} d={:.0} aim=({:.4},{:.4}) want=({:.4},{:.4}) miss_h={:.2} miss_v={:.2} myz={:.1} tz={:.1}",
+                                self.t, dist2(c, muzzle), m.aim[0], m.aim[1], want_yaw, want_pitch, horiz, q[2], m.body.pos[2], tp[2]
+                            );
+                        }
+                    }
+                    self.mechs[i].shots[bucket] += 1;
+                    self.bullets.push(Bullet { bucket, owner: i, npc: false, pos: start, vel: v, dist_left: 230.0, dmg: 45.0 });
                     self.hear(muzzle, "gun", 320.0, i);
                 }
                 if let Some(ch) = fire_laser {
@@ -985,13 +1055,33 @@ impl<'a> Ffa<'a> {
                         }
                     }
                     self.hear(muzzle, "laser", 380.0, i);
+                    self.mechs[i].laser_shots += 1;
                     let mut end = [start[0] + dir[0] * 280.0, start[1] + dir[1] * 280.0, start[2] + dir[2] * 280.0];
                     if let Some((j, tt)) = best {
                         let hit = [start[0] + dir[0] * tt, start[1] + dir[1] * tt, start[2] + dir[2] * tt];
                         let f = |p: [f64; 3]| [p[0] as f32, p[1] as f32, p[2] as f32];
                         if self.w.los(f(start), f(hit)) {
                             end = hit;
+                            self.mechs[i].laser_hits += 1;
                             self.damage(j, i, dmg, "laser", [dir[0], dir[1]]);
+                        }
+                    }
+                    if std::env::var("SHOT_DEBUG").is_ok() && self.mechs[i].kind == Kind::Ours {
+                        for j in 0..n {
+                            if j == i || !self.mechs[j].alive {
+                                continue;
+                            }
+                            let tp = self.mechs[j].body.pos;
+                            let c = [tp[0], tp[1], tp[2] + 4.5];
+                            let want_yaw = (c[1] - muzzle[1]).atan2(c[0] - muzzle[0]);
+                            let want_pitch = (c[2] - muzzle[2]).atan2(dist2(c, muzzle));
+                            let rc = ray_cyl(start, dir, tp, 2.5, 9.0, 280.0);
+                            let f = |p: [f64; 3]| [p[0] as f32, p[1] as f32, p[2] as f32];
+                            let losc = self.w.los(f(start), f(c));
+                            eprintln!(
+                                "LASER t={:.2} d={:.0} charge={:.2} aim=({:.4},{:.4}) want=({:.4},{:.4}) ray={:?} los_center={} hit={}",
+                                self.t, dist2(c, muzzle), ch, self.mechs[i].aim[0], self.mechs[i].aim[1], want_yaw, want_pitch, rc, losc, best.is_some()
+                            );
                         }
                     }
                     // beam seen by everyone near either end (incl. the victim)
@@ -1094,7 +1184,9 @@ impl<'a> Ffa<'a> {
                 if hit.map(|h| tn < h.1).unwrap_or(true) {
                     let owner = b.owner;
                     let dmg = b.dmg;
+                    let bucket = b.bucket;
                     self.bullets.swap_remove(k);
+                    self.mechs[owner].hits[bucket] += 1;
                     self.damage_npc(kn, owner, dmg);
                     continue;
                 }
@@ -1104,7 +1196,11 @@ impl<'a> Ffa<'a> {
                 let dmg = b.dmg;
                 let v = [b.vel[0], b.vel[1]];
                 let is_npc = b.npc;
+                let bucket = b.bucket;
                 self.bullets.swap_remove(k);
+                if !is_npc {
+                    self.mechs[owner].hits[bucket] += 1;
+                }
                 if is_npc {
                     self.npc_hits(j, owner, dmg, v);
                 } else {
@@ -1197,7 +1293,7 @@ impl<'a> Ffa<'a> {
                         let yaw = dd[1].atan2(dd[0]) + (self.rng.f() - 0.5) * 2.0 * sp;
                         let pitch = (dd[2] / l).asin() + (self.rng.f() - 0.5) * 2.0 * sp;
                         let v = [pitch.cos() * yaw.cos() * 90.0, pitch.cos() * yaw.sin() * 90.0, pitch.sin() * 90.0];
-                        self.bullets.push(Bullet { owner: k, npc: true, pos: src, vel: v, dist_left: 120.0, dmg: 25.0 });
+                        self.bullets.push(Bullet { bucket: 0, owner: k, npc: true, pos: src, vel: v, dist_left: 120.0, dmg: 25.0 });
                         self.npcs[k].cooldown = 1.0;
                         self.hear(src, "npc_gun", 200.0, usize::MAX);
                     }

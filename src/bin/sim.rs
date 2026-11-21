@@ -237,6 +237,8 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
     use xero_mech::ffa::{Ffa, Kind};
     let cfg = default_config();
     let w: &'static World = Box::leak(Box::new(load(&cfg)));
+    // all simulated bots share finished flow fields (identical zone discs give identical fields)
+    xero_mech::nav::shared::enable(std::env::var("SIM_NO_SHARE").is_err());
     let mut total = 0.0;
     let mut n_ours: f64 = 0.0;
     let mut zone_deaths = 0;
@@ -244,11 +246,16 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
     let mut place_hist = vec![0u32; 17];
     let mut seen_total = 0.0;
     let mut alive_total = 0.0;
+    let mut acc_s = [0u32; 3];
+    let mut acc_h = [0u32; 3];
+    let mut opp_s = [0u32; 3];
+    let mut opp_h = [0u32; 3];
+    let mut lz = [0u32; 2];
     let t_start = Instant::now();
     for k in 0..runs {
         let seed = seed0 + k;
         let mut kinds = Vec::new();
-        let nmech = if mix.starts_with("duel") { 2 } else { 16 };
+        let nmech = if mix.starts_with("duel") || mix == "dummy" { 2 } else { 16 };
         for i in 0..nmech {
             if i < ours {
                 kinds.push(Kind::Ours);
@@ -261,6 +268,7 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
                     "squad" | "duel" => Kind::Squad,
                     "squad2" => Kind::Squad2,
                     "duelg" => Kind::Aggro,
+                    "dummy" => Kind::Dummy,
                     "hard" => if i % 2 == 0 { Kind::Aggro } else { Kind::Rusher },
                     _ => match i % 3 {
                         0 => Kind::Example,
@@ -294,6 +302,20 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
                 let ms: Vec<String> = modes.iter().take(4).map(|(k, v)| format!("{k}:{:.0}", v)).collect();
                 seen_total += m.seen_s;
                 alive_total += m.alive_s;
+                for b in 0..3 {
+                    acc_s[b] += m.shots[b];
+                    acc_h[b] += m.hits[b];
+                }
+                lz[0] += m.laser_shots;
+                lz[1] += m.laser_hits;
+                for (j, e) in f.mechs.iter().enumerate() {
+                    if j != i && e.kind != Kind::Ours {
+                        for b in 0..3 {
+                            opp_s[b] += e.shots[b];
+                            opp_h[b] += e.hits[b];
+                        }
+                    }
+                }
                 line += &format!(
                     " ours#{i} seen {:.0}/{:.0}s modes {} |",
                     m.seen_s,
@@ -317,6 +339,12 @@ fn ffa(runs: u64, seed0: u64, ours: usize, mix: &str) {
         println!("{line}");
     }
     println!("SEEN fraction {:.3}", seen_total / alive_total.max(1e-9));
+    let pct = |h: u32, s: u32| if s == 0 { 0.0 } else { 100.0 * h as f64 / s as f64 };
+    println!(
+        "ACCURACY ours gun <60 {:.0}% ({}) <120 {:.0}% ({}) >=120 {:.0}% ({}) laser {:.0}% ({}) | opponents gun <60 {:.0}% <120 {:.0}% >=120 {:.0}%",
+        pct(acc_h[0], acc_s[0]), acc_s[0], pct(acc_h[1], acc_s[1]), acc_s[1], pct(acc_h[2], acc_s[2]), acc_s[2], pct(lz[1], lz[0]), lz[0],
+        pct(opp_h[0], opp_s[0]), pct(opp_h[1], opp_s[1]), pct(opp_h[2], opp_s[2])
+    );
     println!(
         "FFA SUMMARY runs {runs} ours/match {ours} mix {mix}: mean score {:.2} wins {wins} early-zone-deaths {zone_deaths} places {:?} ({:.1}s)",
         total / n_ours.max(1.0),

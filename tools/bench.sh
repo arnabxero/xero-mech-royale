@@ -7,7 +7,7 @@ PROCS=${2:-6}
 OURS=${3:-1}
 MIX=${4:-mixed}
 BASE=${5:-1000}
-BIN=./target/release/sim
+BIN=${SIM_BIN:-./target/release/sim}
 [ -x "$BIN.exe" ] && BIN="$BIN.exe"
 OUT=./bench_out
 mkdir -p "$OUT"

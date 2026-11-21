@@ -1,6 +1,7 @@
 pub mod bot;
 pub mod ffa;
 pub mod nav;
+pub mod oppbot;
 pub mod proto;
 pub mod world;
 pub mod sim;

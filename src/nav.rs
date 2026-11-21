@@ -18,6 +18,37 @@ fn unkey(k: u64) -> (f32, u32) {
     (f32::from_bits((k >> 32) as u32), (k & 0xffff_ffff) as u32)
 }
 
+/// Simulator-only cache of finished flow fields shared by all bots in one process
+/// (every bot seeded from the same zone disc computes an identical field).
+pub mod shared {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    thread_local! {
+        pub static ENABLED: RefCell<bool> = const { RefCell::new(false) };
+        pub static CACHE: RefCell<HashMap<(i64, i64, i64), Rc<(Vec<f32>, Vec<u32>, f32)>>> = RefCell::new(HashMap::new());
+    }
+    pub fn enabled() -> bool {
+        ENABLED.with(|e| *e.borrow())
+    }
+    pub fn enable(on: bool) {
+        ENABLED.with(|e| *e.borrow_mut() = on);
+        CACHE.with(|c| c.borrow_mut().clear());
+    }
+    pub fn get(tag: (i64, i64, i64)) -> Option<Rc<(Vec<f32>, Vec<u32>, f32)>> {
+        CACHE.with(|c| c.borrow().get(&tag).cloned())
+    }
+    pub fn put(tag: (i64, i64, i64), dist: &[f32], next: &[u32], radius: f32) {
+        CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() > 64 {
+                c.clear();
+            }
+            c.insert(tag, Rc::new((dist.to_vec(), next.to_vec(), radius)));
+        })
+    }
+}
+
 pub struct FlowField {
     pub dist: Vec<f32>,
     pub next: Vec<u32>,
