@@ -13,7 +13,7 @@ type Track = { id: number; pos: number[]; vel: number[]; hp: number; maxHp: numb
 
 const WEAPON_PREF: Record<string, number> = { laser: 3.2, lightning: 2.5, mortar: 1, gun: 0 }
 const UPGRADE_PREF = [
-  "plating", "armor", "nanites", "lightning_efficiency", "laser_damage", "laser_charge", "gun_damage", "gun_rate",
+  "laser_damage", "laser_charge", "gun_damage", "gun_rate", "plating", "armor", "nanites", "lightning_efficiency",
   "lightning_range", "lightning_chain", "gyros", "servos", "gun_mag", "capacitor", "reactor", "jets", "gun_velocity",
   "sensors", "mortar_reload", "mortar_velocity", "mortar_splash", "laser_pierce",
 ]
