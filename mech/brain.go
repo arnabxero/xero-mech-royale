@@ -170,7 +170,7 @@ func NewBrain(h *Hello, w *World) *Brain {
 		seed = int64(h.Slot) + 1
 	}
 	return &Brain{
-		W: w, Cfg: h.Config, Slot: h.Slot, rng: rand.New(rand.NewSource(seed)), P: DefaultParams(),
+		W: w, Cfg: h.Config, Slot: h.Slot, rng: rand.New(rand.NewSource(seed + xeroSalt)), P: DefaultParams(),
 		tracks: map[int]*Track{}, npcs: map[int]*Track{}, crates: map[int]*known{}, cubes: map[int]*known{},
 		pickups: map[int]*known{}, bad: map[int]float64{}, strafe: 1, lootID: -1, lastHurt: -100, lastThreatAt: -100,
 		holdStart: -1,
